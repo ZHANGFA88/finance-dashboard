@@ -5,17 +5,25 @@
 >
 > ⚠️ 数据仅供参考，不构成投资建议。
 
-📖 **详细产品介绍与界面截图见 [docs/PRODUCT.md](docs/PRODUCT.md)**
-
----
-
 ## 📸 界面预览
 
-| 主大屏 | K线弹窗 |
-|:---:|:---:|
-| ![主大屏](docs/screenshots/01-dashboard.png) | ![K线](docs/screenshots/02-kline.png) |
-| **深度分析** | **筹码分布** |
-| ![深度分析](docs/screenshots/03-analyze.png) | ![筹码](docs/screenshots/04-cyq.png) |
+**主大屏 · 全品类行情一览**
+
+![主大屏](docs/screenshots/01-dashboard.png)
+
+**K线弹窗 · 点击个股深入**
+
+![K线](docs/screenshots/02-kline.png)
+
+**深度分析 · 技术面全维解读**
+
+![深度分析](docs/screenshots/03-analyze.png)
+
+**筹码分布 · 成本结构透视**
+
+![筹码](docs/screenshots/04-cyq.png)
+
+📖 更多说明见 [docs/PRODUCT.md](docs/PRODUCT.md)
 
 ---
 
