@@ -742,6 +742,84 @@ def fetch_indices():
         pass
     return out
 
+# 全球大盘指数配置：[新浪代码, 显示名, 市场分组]
+GLOBAL_INDEX_MAP = [
+    ('gb_$dji', '道琼斯', 'us'),
+    ('gb_ixic', '纳斯达克', 'us'),
+    ('gb_inx', '标普500', 'us'),
+    ('int_hangseng', '恒生指数', 'hk'),
+    ('int_nikkei', '日经225', 'asia'),
+    ('int_ftse', '英国FTSE', 'eu'),
+    ('btc_btcbtcusd', '比特币', 'crypto'),
+    ('btc_btcethusd', '以太坊', 'crypto'),
+]
+
+def fetch_global_indices():
+    """全球大盘指数（新浪源，单请求拿全部，比Yahoo稳）。含美股盘中/恒生/日经/英股/加密"""
+    import subprocess
+    codes = ','.join(c for c, _, _ in GLOBAL_INDEX_MAP)
+    meta = {c: (nm, mk) for c, nm, mk in GLOBAL_INDEX_MAP}
+    out = []
+    try:
+        url = 'https://hq.sinajs.cn/list=' + codes
+        raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                              '-H', 'Referer: https://finance.sina.com.cn',
+                              '-H', 'User-Agent: ' + UA, url],
+                             capture_output=True, timeout=13).stdout.decode('gbk', 'ignore')
+        for line in raw.strip().split(';'):
+            line = line.strip()
+            if '="' not in line:
+                continue
+            # 提取代码（hq_str_ 后面直到 =）
+            code = line.split('hq_str_')[-1].split('=')[0].strip()
+            payload = line.split('"')[1] if '"' in line else ''
+            f = payload.split(',')
+            if code not in meta or len(f) < 4:
+                continue
+            nm, mk = meta[code]
+            try:
+                if mk == 'crypto':
+                    # 新浪加密格式: 时间,,,价格(idx3),0,买,高(idx6),低(idx7),参考价(idx8),名称(idx9),...
+                    price = float(f[3])
+                    prev = float(f[8]) if len(f) > 8 else 0
+                    pct = round((price - prev) / prev * 100, 2) if prev else 0.0
+                    out.append({'symbol': code, 'name': nm, 'market': mk,
+                                'price': round(price, 2), 'change_pct': pct,
+                                'change_amt': round(price - prev, 2) if prev else 0,
+                                'state': 'REGULAR', 'ts': int(time.time())})
+                elif code.startswith('gb_'):
+                    # 美股: 名称,当前价(idx1),涨跌幅(idx2),时间,涨跌额(idx4)
+                    price = float(f[1]); pct = float(f[2]); amt = float(f[4]) if len(f) > 4 else 0
+                    out.append({'symbol': code, 'name': nm, 'market': mk,
+                                'price': round(price, 2), 'change_pct': round(pct, 2),
+                                'change_amt': round(amt, 2), 'state': 'REGULAR', 'ts': int(time.time())})
+                else:
+                    # int_ 国际指数: 名称,当前价(idx1),涨跌额(idx2),涨跌幅(idx3)
+                    price = float(f[1]); amt = float(f[2]); pct = float(f[3])
+                    out.append({'symbol': code, 'name': nm, 'market': mk,
+                                'price': round(price, 2), 'change_pct': round(pct, 2),
+                                'change_amt': round(amt, 2), 'state': 'REGULAR', 'ts': int(time.time())})
+            except (ValueError, IndexError):
+                continue
+    except Exception:
+        pass
+    # 保持配置顺序
+    order = {c: i for i, (c, _, _) in enumerate(GLOBAL_INDEX_MAP)}
+    out.sort(key=lambda x: order.get(x['symbol'], 99))
+    return out
+
+_global_idx_cache = {'data': None, 'ts': 0}
+def _global_index_cache_get(ttl=60):
+    """全球大盘指数带缓存(默认60s)"""
+    now = time.time()
+    if _global_idx_cache['data'] and now - _global_idx_cache['ts'] < ttl:
+        return _global_idx_cache['data']
+    data = fetch_global_indices()
+    if data:
+        _global_idx_cache['data'] = data; _global_idx_cache['ts'] = now
+        return data
+    return _global_idx_cache['data'] or []
+
 def fetch_sectors(kind='concept', limit=10):
     """板块涨幅榜+资金流。kind: concept(概念 t:3) / industry(行业 t:2)，curl拉+重试"""
     t = '3' if kind == 'concept' else '2'
@@ -1098,6 +1176,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_cyq(q)
             if path == '/api/finance/indices':
                 return self._api_indices(q)
+            if path == '/api/finance/global':
+                return self._api_global(q)
             if path == '/api/finance/sectors':
                 return self._api_sectors(q)
             if path == '/' :
@@ -1217,6 +1297,11 @@ class Handler(SimpleHTTPRequestHandler):
         idx = _index_cache_get()
         return self._json(200, {'ok': True, 'items': idx, 'trend': classify_index_trend(idx),
                                 'ts': int(time.time())})
+
+    def _api_global(self, q):
+        """全球大盘指数（美股/夜盘期货/恒生/日经/欧股/加密，带缓存）"""
+        data = _global_index_cache_get()
+        return self._json(200, {'ok': True, 'items': data, 'ts': int(time.time())})
 
     def _api_sectors(self, q):
         """板块热点涨幅榜。kind: concept(概念) / industry(行业)，带缓存"""
@@ -1342,6 +1427,18 @@ if __name__ == '__main__':
                 time.sleep(20)
         t = threading.Thread(target=bg_refresh, daemon=True)
         t.start()
+
+        # 全球大盘指数预热线程（独立节奏，错开自选刷新防限流，让前端首次秒开）
+        def bg_global():
+            time.sleep(5)  # 先让自选首轮跑完，错开
+            while True:
+                try:
+                    _global_index_cache_get(ttl=55)
+                except Exception:
+                    pass
+                time.sleep(55)
+        tg = threading.Thread(target=bg_global, daemon=True)
+        tg.start()
         srv = ThreadingHTTPServer((HOST, PORT), Handler)
         print(f'FinSight serving at http://{HOST}:{PORT}')
         try:
