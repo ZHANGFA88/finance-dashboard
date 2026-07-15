@@ -863,7 +863,7 @@ def _index_cache_get(ttl=30):
     return idx or (_idx_cache['data'] or [])
 
 def _sector_cache_get(kind='concept', ttl=60):
-    """板块热点带缓存(默认60s)，避免大屏轮询频繁打东财"""
+    """板块热点带缓存(默认60s)，避免大屏轮询频繁打东财。空结果也短缓存，避免休市时反复7秒空重试"""
     now = time.time()
     c = _sector_cache.get(kind)
     if c and now - c['ts'] < ttl:
@@ -872,7 +872,9 @@ def _sector_cache_get(kind='concept', ttl=60):
     if data:
         _sector_cache[kind] = {'data': data, 'ts': now}
         return data
-    return (c['data'] if c else [])
+    # 空结果也缓存(旧值或空列表)，避免下次又花7秒重试空拉
+    _sector_cache[kind] = {'data': (c['data'] if c else []), 'ts': now}
+    return _sector_cache[kind]['data']
 
 def classify_index_trend(idx):
     """大盘定性：由四大指数当日涨跌粗判"""
@@ -1434,6 +1436,12 @@ if __name__ == '__main__':
             while True:
                 try:
                     _global_index_cache_get(ttl=55)
+                except Exception:
+                    pass
+                # 板块热点预热（概念+行业，让前端秒开，7.7s->秒回）
+                try:
+                    _sector_cache_get('concept', ttl=55)
+                    _sector_cache_get('industry', ttl=55)
                 except Exception:
                     pass
                 time.sleep(55)
