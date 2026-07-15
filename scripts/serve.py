@@ -974,6 +974,68 @@ def judge_bull_bear(ind, klines, index_env=None, sector_env=None):
         'verify_signals': signals,
     }
 
+def generate_narrative(name, ind, analysis, index_env=None):
+    """B5-A: 将 B3 结构化判断拼成一段流畅中文点评（纯模板，零依赖）"""
+    if not analysis or not analysis.get('ok') or not ind or not ind.get('ok'):
+        return ''
+    cp = ind.get('close'); pct = ind.get('change_pct', 0) or 0
+    stance = analysis.get('stance', '')
+    strength = analysis.get('strength', '')
+    bs = analysis.get('bull_score', 0); rs = analysis.get('bear_score', 0)
+    bull = analysis.get('bull_factors') or []
+    bear = analysis.get('bear_factors') or []
+    signals = analysis.get('verify_signals') or []
+
+    # 开头：名称 + 涨跌 + 收价
+    move = '上涨' if pct > 0 else ('下跌' if pct < 0 else '平收')
+    seg = ['%s今日%s%.2f%%，收于%s。' % (name, move, abs(pct), cp)]
+
+    # 取最多3个因子(去掉开头涨跌重复、以及大盘环境因子避免末尾重复)
+    def _trim(fac):
+        out = []
+        for f in fac:
+            if f.startswith('上涨') or f.startswith('下跌') or f.startswith('大涨') or f.startswith('大跌'):
+                continue
+            if f.startswith('大盘'):
+                continue
+            out.append(f)
+        return out
+    bull_r = _trim(bull)[:3]
+    bear_r = _trim(bear)[:3]
+
+    if stance in ('多头主导', '偏多'):
+        lead = '多头%s占优(%d:%d)' % ('强势' if strength == '强' else '暂', bs, rs)
+        if bull_r:
+            seg.append('%s，%s。' % (lead, '；'.join(bull_r)))
+        else:
+            seg.append('%s。' % lead)
+        if bear_r:
+            seg.append('但%s，上方仍有制约。' % '；'.join(bear_r))
+    elif stance in ('空头主导', '偏空'):
+        lead = '空头%s占优(%d:%d)' % ('强势' if strength == '强' else '暂', rs, bs)
+        if bear_r:
+            seg.append('%s，%s。' % (lead, '；'.join(bear_r)))
+        else:
+            seg.append('%s。' % lead)
+        if bull_r:
+            seg.append('不过%s，下方尚有支撑。' % '；'.join(bull_r))
+    else:
+        seg.append('多空分歧明显(多%d空%d)。' % (bs, rs))
+        if bull_r:
+            seg.append('多方：%s。' % '；'.join(bull_r))
+        if bear_r:
+            seg.append('空方：%s。' % '；'.join(bear_r))
+
+    # 大盘环境
+    if index_env and index_env not in ('unknown', '震荡整理'):
+        seg.append('大盘%s，需兼顾环境。' % index_env)
+
+    # 次日验证
+    if signals:
+        seg.append('后市：%s。' % '；'.join(s.rstrip('。') for s in signals[:2]))
+
+    return ''.join(seg)
+
 # ========== HTTP 服务 ==========
 _quote_cache = {'data': None, 'ts': 0}
 QUOTE_TTL = 8  # 秒
@@ -1095,11 +1157,13 @@ class Handler(SimpleHTTPRequestHandler):
         # 板块（仅A股参考概念涨幅榜首位作为环境，不做个股精确映射）
         sector_env = None
         analysis = judge_bull_bear(ind, rows, index_env=index_trend, sector_env=sector_env)
+        narrative = generate_narrative(name, ind, analysis, index_env=index_trend)
         return self._json(200, {
             'ok': True, 'symbol': symbol, 'name': name, 'period': period,
             'indicators': ind,
             'market_env': {'trend': index_trend, 'indices': idx},
             'analysis': analysis,
+            'narrative': narrative,
             'ts': int(time.time()),
         })
 

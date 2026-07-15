@@ -300,6 +300,11 @@
     background: rgba(212,175,90,0.08); border-left: 2px solid var(--gold); line-height: 1.45; }
   .an-env { font-size: 12px; color: var(--text-dim); }
   .an-env b { color: var(--text); }
+  .an-narrative { padding: 12px 14px; margin-bottom: 14px; border-radius: 10px; line-height: 1.7;
+    font-size: 13px; color: var(--text); background: rgba(212,175,90,0.06);
+    border: 1px solid rgba(212,175,90,0.25); }
+  .an-nr-tag { display: inline-block; margin-right: 8px; padding: 1px 8px; border-radius: 5px;
+    font-size: 11px; color: #1a1206; background: var(--gold); font-weight: 700; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -710,6 +715,10 @@
     const cell = (lab, val, cls) => '<div class="an-cell"><span class="cl">' + lab + '</span><span class="cv ' + (cls||'') + '">' + val + '</span></div>';
     const nz = v => (v==null? '--' : v);
     let html = '';
+    // 自然语言解读
+    if (d.narrative) {
+      html += '<div class="an-narrative"><span class="an-nr-tag">📝 解读</span>' + d.narrative + '</div>';
+    }
     // 结论
     html += '<div class="an-verdict">' +
       '<div class="an-stance ' + scls + '">' + (a.stance||'--') + '</div>' +
