@@ -18,8 +18,9 @@
 - [x] **S5** cobe 3D 地球（背景/侧栏装饰，window.createGlobe UMD）
 - [x] **S6** 点击个股 → K线弹窗（canvas 折线，接 /kline）
 - [x] **S7** 数据陈旧(stale)/涨跌 视觉标识 + 动画
-- [ ] **S8** 本地实测（curl + 浏览器验收截图逻辑）
-- [ ] **S9** git 提交 Day2
+- [x] **S8** 本地实测（curl 全端点 + playwright 浏览器验收）
+  - 5个API全通：quotes(13只)/kline(250根)/watchlist(13)/alerts(2条)/analyze(偏多)，playwright截图无控制台错误
+- [x] **S9** git 提交 Day2
 
 ## Day 3 📋 里程碑A：异动监控报警（拆封中）
 
