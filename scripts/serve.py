@@ -771,6 +771,7 @@ def fetch_sectors(kind='concept', limit=10):
     return out
 
 _idx_cache = {'data': None, 'ts': 0}
+_cyq_cache = {}  # symbol -> {data, ts}  C2 筹码缓存
 def _index_cache_get(ttl=30):
     """大盘四大指数带缓存(默认30s)，避免 analyze 频繁拉新浪"""
     now = time.time()
@@ -1079,6 +1080,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_alerts(q)
             if path == '/api/finance/analyze':
                 return self._api_analyze(q)
+            if path == '/api/finance/cyq':
+                return self._api_cyq(q)
             if path == '/' :
                 self.path = '/public/finance.html'
         except Exception as e:
@@ -1166,6 +1169,45 @@ class Handler(SimpleHTTPRequestHandler):
             'narrative': narrative,
             'ts': int(time.time()),
         })
+
+    def _api_cyq(self, q):
+        """C2: 筹码分布。subprocess 调独立 .cyqenv 跑 cyq_report.py（akshare 重依赖隔离），带 60s 缓存。"""
+        symbol = (q.get('symbol') or [''])[0]
+        if not symbol:
+            return self._json(400, {'ok': False, 'error': 'symbol required'})
+        now = time.time()
+        cached = _cyq_cache.get(symbol)
+        if cached and now - cached['ts'] < 60:
+            return self._json(200, cached['data'])
+        py = os.path.join(BASE_DIR, '.cyqenv', 'bin', 'python')
+        script = os.path.join(BASE_DIR, 'scripts', 'cyq_report.py')
+        if not os.path.exists(py):
+            return self._json(200, {'ok': False, 'error': 'cyq env missing (未建 .cyqenv)', 'symbol': symbol})
+        import subprocess
+        # requests 会继承 macOS 系统代理导致连东财失败，强制直连
+        env = dict(os.environ)
+        env.update({'no_proxy': '*', 'NO_PROXY': '*', 'HTTP_PROXY': '', 'HTTPS_PROXY': '', 'ALL_PROXY': ''})
+        try:
+            out = subprocess.run([py, script, symbol], capture_output=True, timeout=30, env=env)
+            raw = out.stdout.decode('utf-8', 'ignore').strip()
+            # 取最后一行 JSON（避免 warning 污染）
+            line = ''
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if ln.startswith('{') and ln.endswith('}'):
+                    line = ln
+            if not line:
+                err = out.stderr.decode('utf-8', 'ignore')[-300:] or 'no output'
+                return self._json(200, {'ok': False, 'error': 'cyq subprocess: ' + err, 'symbol': symbol})
+            data = json.loads(line)
+            data['ts'] = int(now)
+            if data.get('ok'):
+                _cyq_cache[symbol] = {'data': data, 'ts': now}
+            return self._json(200, data)
+        except subprocess.TimeoutExpired:
+            return self._json(200, {'ok': False, 'error': 'cyq timeout (30s)', 'symbol': symbol})
+        except Exception as e:
+            return self._json(200, {'ok': False, 'error': 'cyq error: %s' % e, 'symbol': symbol})
 
 if __name__ == '__main__':
     init_db()

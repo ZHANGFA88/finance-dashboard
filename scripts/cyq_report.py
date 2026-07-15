@@ -27,13 +27,20 @@ def main():
     except Exception as e:
         print(json.dumps({'ok': False, 'error': 'akshare import failed: %s' % e}, ensure_ascii=False))
         return
-    try:
-        df = ak.stock_cyq_em(symbol=code, adjust="")
-    except Exception as e:
-        print(json.dumps({'ok': False, 'error': 'stock_cyq_em failed: %s' % e, 'code': code}, ensure_ascii=False))
-        return
+    df = None
+    last_err = None
+    for attempt in range(5):
+        try:
+            df = ak.stock_cyq_em(symbol=code, adjust="")
+            if df is not None and not df.empty:
+                break
+        except Exception as e:
+            last_err = e
+        import time as _t
+        _t.sleep(0.8 * (attempt + 1))  # 退避重试
     if df is None or df.empty:
-        print(json.dumps({'ok': False, 'error': 'empty data', 'code': code}, ensure_ascii=False))
+        msg = ('stock_cyq_em failed: %s' % last_err) if last_err else 'empty data'
+        print(json.dumps({'ok': False, 'error': msg, 'code': code}, ensure_ascii=False))
         return
 
     # 列名（东财接口）：日期 获利比例 平均成本 90成本-低 90成本-高 90集中度 70成本-低 70成本-高 70集中度

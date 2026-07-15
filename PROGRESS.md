@@ -79,7 +79,10 @@
   - akshare `stock_cyq_em` 返回筹码指标: 获利比例/平均成本/90-70成本区间/集中度 + 近30日序列
   - 验收: `600206` 输出真实数据(获利5.81%/均本55.82/90成本区45.63-63.63) ✅
   - ⚠️ 坑: requests 继承 macOS 系统代理连东财失败, 必须带 `no_proxy='*'` 强制直连(C2 subprocess 也要带)
-- [ ] **C2** 主后端 /api/finance/cyq?symbol= subprocess 调 .cyqenv, 返回筹码JSON(带缓存)
+- [x] **C2** 主后端 /api/finance/cyq?symbol= subprocess 调 .cyqenv，返回筹码JSON(带60s缓存)
+  - _api_cyq: subprocess 调 .cyqenv/bin/python cyq_report.py，强制 no_proxy=* 直连，取最后一行JSON避免warning污染
+  - cyq_report.py 内部5次退避重试(东财偶发连接重置) + 60s缓存，命中后秒回
+  - 验收: 连续多次 API 返回真实筹码(获利5.78% series30) ✅
 - [ ] **C3** K线弹窗加第三Tab「筹码」: 成本区间带状图 + 获利盘/集中度指标
 
 ## 数据格式备忘
