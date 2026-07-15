@@ -655,6 +655,32 @@ def calc_rsi(closes, n=14):
     rs = ag / al
     return round(100 - 100 / (1 + rs), 2)
 
+def calc_boll(closes, n=20, k=2):
+    """BOLL布林带: 中轨(MA20) + 上/下轨(±2倍标准差) + 带宽/开口收口"""
+    if len(closes) < n:
+        return {'mid': None, 'upper': None, 'lower': None, 'bandwidth': None, 'pos': None, 'state': None}
+    seg = closes[-n:]
+    mid = sum(seg) / n
+    var = sum((c - mid) ** 2 for c in seg) / n
+    std = var ** 0.5
+    upper = mid + k * std
+    lower = mid - k * std
+    price = closes[-1]
+    bandwidth = round((upper - lower) / mid * 100, 2) if mid else None  # 带宽%
+    # 价格在带内位置 0(下轨)~1(上轨)
+    pos = round((price - lower) / (upper - lower), 2) if upper > lower else 0.5
+    # 开口/收口: 对比5日前带宽
+    state = None
+    if len(closes) >= n + 5:
+        seg0 = closes[-n - 5:-5]
+        mid0 = sum(seg0) / n
+        std0 = (sum((c - mid0) ** 2 for c in seg0) / n) ** 0.5
+        bw0 = (2 * k * std0) / mid0 * 100 if mid0 else 0
+        if bandwidth and bw0:
+            state = 'opening' if bandwidth > bw0 * 1.15 else ('closing' if bandwidth < bw0 * 0.85 else 'stable')
+    return {'mid': round(mid, 3), 'upper': round(upper, 3), 'lower': round(lower, 3),
+            'bandwidth': bandwidth, 'pos': pos, 'state': state}
+
 def calc_volume_stats(klines):
     """量能：当日量、相对5日/20日均量比"""
     vols = [k['volume'] for k in klines]
@@ -679,6 +705,49 @@ def calc_high_low(klines, periods=(20, 60)):
             out['low_%d' % p] = round(min(k['low'] for k in seg), 3)
     return out
 
+def calc_support_resistance(klines, ma):
+    """支撑/压力位：综合近N日高低点 + 均线 + 整数关。
+    返回价格上方最近压力位、下方最近支撑位，及候选列表"""
+    if not klines or len(klines) < 5:
+        return {}
+    price = klines[-1]['close']
+    cands = []  # (价格, 标签)
+    # 近20/60日高低点
+    for p in (20, 60):
+        seg = klines[-p:] if len(klines) >= p else klines
+        if seg:
+            cands.append((round(max(k['high'] for k in seg), 2), '%d日高' % p))
+            cands.append((round(min(k['low'] for k in seg), 2), '%d日低' % p))
+    # 均线
+    for key in ('MA20', 'MA60', 'MA120'):
+        v = ma.get(key)
+        if v:
+            cands.append((round(v, 2), key))
+    # 局部摆高摆低（分形高点/低点，左右2根）
+    n = len(klines)
+    for i in range(2, n - 2):
+        h = klines[i]['high']; l = klines[i]['low']
+        if h >= klines[i-1]['high'] and h >= klines[i-2]['high'] and h >= klines[i+1]['high'] and h >= klines[i+2]['high']:
+            cands.append((round(h, 2), '前高'))
+        if l <= klines[i-1]['low'] and l <= klines[i-2]['low'] and l <= klines[i+1]['low'] and l <= klines[i+2]['low']:
+            cands.append((round(l, 2), '前低'))
+    # 分上下，去重聚合(接近的1%内归一类)
+    res = sorted(set(c for c in cands if c[0] > price * 1.001), key=lambda x: x[0])
+    sup = sorted(set(c for c in cands if c[0] < price * 0.999), key=lambda x: -x[0])
+    def dedup(lst):
+        out = []
+        for pv, lab in lst:
+            if out and abs(pv - out[-1]['price']) / out[-1]['price'] < 0.008:
+                out[-1]['labels'].append(lab)
+            else:
+                out.append({'price': pv, 'labels': [lab]})
+        return out[:3]
+    return {
+        'price': price,
+        'resistance': dedup(res),  # 上方压力(由近到远)
+        'support': dedup(sup),     # 下方支撑(由近到远)
+    }
+
 def compute_indicators(klines):
     """聚合所有技术指标。输入 K线列表(按日期升序)"""
     if not klines or len(klines) < 2:
@@ -689,17 +758,20 @@ def compute_indicators(klines):
     last = klines[-1]
     prev_close = klines[-2]['close']
     change_pct = round((last['close'] / prev_close - 1) * 100, 2) if prev_close else 0
+    ma = calc_ma(closes)
     return {
         'ok': True,
         'date': last['date'],
         'close': last['close'],
         'change_pct': change_pct,
-        'ma': calc_ma(closes),
+        'ma': ma,
         'macd': calc_macd(closes),
         'kdj': calc_kdj(highs, lows, closes),
         'rsi': calc_rsi(closes),
+        'boll': calc_boll(closes),
         'volume': calc_volume_stats(klines),
         'high_low': calc_high_low(klines),
+        'sr': calc_support_resistance(klines, ma),
     }
 
 # ========== 大盘环境 + 板块热点（里程B2）==========
@@ -849,6 +921,113 @@ def fetch_sectors(kind='concept', limit=10):
         time.sleep(1.2 * (attempt + 1))  # 退避重试
     return out
 
+def fetch_top_movers_cn(limit=40):
+    """全市场A股涨幅榜(锉选股候选池)。返回 [{code,name,change_pct,price,turnover_rate,main_inflow}]
+    东财 fs: 沪深A股(排除ST/科创/创业可选)，按涨幅降序"""
+    import subprocess
+    # m:0 t:6=深主板 m:0 t:80=创业 m:1 t:2=沪主板 m:1 t:23=科创
+    fs = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23'
+    url = ('https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3'
+           '&fs=%s&fields=f12,f14,f2,f3,f8,f62' % (limit, fs))
+    for attempt in range(3):
+        try:
+            raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                                  '-H', 'Referer: https://quote.eastmoney.com/',
+                                  '-H', 'User-Agent: ' + UA, url],
+                                 capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+            d = json.loads(raw)
+            diff = (d.get('data') or {}).get('diff') or {}
+            rows = diff.values() if isinstance(diff, dict) else diff
+            out = []
+            for r in rows:
+                code = r.get('f12'); name = r.get('f14')
+                if not code or not name:
+                    continue
+                pct = r.get('f3')
+                # 代码 -> 带后缀: 6开头沪市.SS, 其余.SZ
+                sym = code + ('.SS' if code.startswith('6') else '.SZ')
+                out.append({
+                    'code': code, 'symbol': sym, 'name': name,
+                    'change_pct': round(float(pct) / 100.0, 2) if pct not in (None, '-') else 0,
+                    'price': round(float(r.get('f2')) / 100.0, 2) if r.get('f2') not in (None, '-') else None,
+                    'turnover_rate': round(float(r.get('f8')) / 100.0, 2) if r.get('f8') not in (None, '-') else None,
+                    'main_inflow': r.get('f62'),
+                })
+            if out:
+                return out
+        except Exception:
+            pass
+        time.sleep(1.2 * (attempt + 1))
+    return []
+
+def score_pick(symbol, name, hot_pct=None):
+    """对单只股技术打分(走稳定K线)。返回 {symbol,name,score,stance,reasons,close,change_pct} 或 None"""
+    rows = get_kline_db(symbol, 'daily')
+    if not rows or len(rows) < 30:
+        fetched = fetch_kline(symbol, 'daily')
+        if fetched:
+            save_kline(fetched)
+            rows = get_kline_db(symbol, 'daily')
+    if not rows or len(rows) < 30:
+        return None
+    klines = [{'date': r['date'], 'open': r['open'], 'high': r['high'],
+               'low': r['low'], 'close': r['close'], 'volume': r['volume']} for r in rows]
+    ind = compute_indicators(klines)
+    if not ind.get('ok'):
+        return None
+    analysis = judge_bull_bear(ind, klines)
+    if not analysis.get('ok'):
+        return None
+    # 选股评分: 多空分差为主 + 关键信号加权
+    score = (analysis.get('bull_score', 0) - analysis.get('bear_score', 0)) * 10
+    reasons = list(analysis.get('bull_factors', []))[:5]
+    macd = ind.get('macd') or {}
+    kdj = ind.get('kdj') or {}
+    boll = ind.get('boll') or {}
+    vol = ind.get('volume') or {}
+    # 加分项(今日可能走强的信号)
+    if macd.get('gold_cross'): score += 15
+    if kdj.get('signal') == 'gold_cross': score += 8
+    if kdj.get('signal') == 'oversold': score += 6
+    if boll.get('state') == 'opening': score += 6
+    vr5 = vol.get('vol_ratio_5')
+    if vr5 and vr5 >= 1.5 and (ind.get('change_pct') or 0) > 0: score += 10
+    if hot_pct is not None and hot_pct >= 2: score += 5  # 所属热点加持
+    return {
+        'symbol': symbol, 'name': name,
+        'score': round(score, 1),
+        'stance': analysis.get('stance'),
+        'strength': analysis.get('strength'),
+        'close': ind.get('close'),
+        'change_pct': ind.get('change_pct'),
+        'reasons': reasons,
+        'macd_gold': bool(macd.get('gold_cross')),
+        'kdj_signal': kdj.get('signal'),
+    }
+
+_picks_cache = {'data': None, 'ts': 0}
+def compute_daily_picks(top_n=8, scan=30):
+    """每日选股: 扫涨幅榜候选池 -> 逐只技术打分 -> 取Top N。
+    东财涨幅榜限流时降级用自选A股作候选池"""
+    cands = fetch_top_movers_cn(limit=scan)
+    source = 'hot'
+    if not cands:
+        # 降级: 用自选A股
+        with db() as c:
+            rs = c.execute("SELECT symbol,name FROM watchlist WHERE market='cn' ORDER BY sort_order").fetchall()
+        cands = [{'symbol': r['symbol'], 'name': r['name'], 'change_pct': None} for r in rs]
+        source = 'watchlist'
+    picks = []
+    for cd in cands:
+        try:
+            p = score_pick(cd['symbol'], cd['name'], hot_pct=cd.get('change_pct'))
+            if p:
+                picks.append(p)
+        except Exception:
+            continue
+    picks.sort(key=lambda x: -x['score'])
+    return {'source': source, 'scanned': len(cands), 'picks': picks[:top_n], 'date': time.strftime('%Y-%m-%d')}
+
 _idx_cache = {'data': None, 'ts': 0}
 _cyq_cache = {}  # symbol -> {data, ts}  C2 筹码缓存
 _sector_cache = {}  # kind -> {data, ts}  板块缓存
@@ -981,6 +1160,23 @@ def judge_bull_bear(ind, klines, index_env=None, sector_env=None):
             bull_score += 1; bull.append('RSI=%.0f 超卖，或有反弹' % rsi)
         elif rsi <= 45:
             bear_score += 1; bear.append('RSI=%.0f 偏弱' % rsi)
+
+    # 6.5) BOLL布林带
+    boll = ind.get('boll') or {}
+    if boll.get('upper') is not None:
+        bpos = boll.get('pos')
+        if c > boll['upper']:
+            bull_score += 1; bull.append('突破布林上轨(%.2f)，强势' % boll['upper'])
+        elif c < boll['lower']:
+            bull_score += 1; bull.append('跌破布林下轨(%.2f)，超跌或反弹' % boll['lower'])
+        elif bpos is not None and bpos >= 0.8:
+            bear.append('贴近布林上轨，短线较高')
+        elif bpos is not None and bpos <= 0.2:
+            bull.append('贴近布林下轨，下方有支撑')
+        if boll.get('state') == 'opening':
+            bull.append('布林带开口(带宽%.1f%%)，波动放大' % (boll.get('bandwidth') or 0))
+        elif boll.get('state') == 'closing':
+            bull.append('布林带收口，选方向临近')
 
     # 7) 量能
     vr5 = vol.get('vol_ratio_5')
@@ -1182,6 +1378,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_global(q)
             if path == '/api/finance/sectors':
                 return self._api_sectors(q)
+            if path == '/api/finance/picks':
+                return self._api_picks(q)
             if path == '/' :
                 self.path = '/public/finance.html'
         except Exception as e:
@@ -1312,6 +1510,21 @@ class Handler(SimpleHTTPRequestHandler):
             kind = 'concept'
         data = _sector_cache_get(kind=kind)
         return self._json(200, {'ok': True, 'kind': kind, 'items': data, 'ts': int(time.time())})
+
+    def _api_picks(self, q):
+        """每日热点选股: 扫涨幅榜技术打分 Top N，带 5分钟缓存(扫描耗时)"""
+        now = time.time()
+        force = (q.get('force') or ['0'])[0] == '1'
+        if not force and _picks_cache['data'] and now - _picks_cache['ts'] < 300:
+            d = dict(_picks_cache['data']); d['cached'] = True
+            return self._json(200, {'ok': True, **d, 'ts': int(now)})
+        try:
+            top_n = min(int((q.get('top') or ['8'])[0]), 20)
+        except ValueError:
+            top_n = 8
+        result = compute_daily_picks(top_n=top_n)
+        _picks_cache['data'] = result; _picks_cache['ts'] = now
+        return self._json(200, {'ok': True, **result, 'cached': False, 'ts': int(now)})
 
     def _api_analyze(self, q):
         """B4: 聚合 B1指标 + B2大盘/板块 + B3多空判断，返回结构化技术面解读"""
