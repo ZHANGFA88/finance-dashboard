@@ -48,11 +48,37 @@
   }
   .layout {
     display: grid;
-    grid-template-rows: 64px 1fr 32px;
+    grid-template-rows: 64px auto 1fr 32px;
     height: 100vh;
     padding: 14px 22px;
     gap: 12px;
   }
+  /* A4 异动提示条 */
+  .alert-bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 16px; height: 40px;
+    background: rgba(232,184,102,0.08);
+    border: 1px solid rgba(232,184,102,0.25);
+    border-radius: 10px; overflow: hidden;
+  }
+  .alert-bar.active {
+    background: rgba(255,77,94,0.08);
+    border-color: rgba(255,77,94,0.3);
+    animation: alertGlow 2s ease-in-out infinite;
+  }
+  @keyframes alertGlow { 0%,100%{box-shadow:0 0 0 rgba(255,77,94,0);} 50%{box-shadow:0 0 16px rgba(255,77,94,0.25);} }
+  .alert-icon { font-size: 16px; flex: 0 0 auto; }
+  .alert-track { flex: 1; overflow: hidden; white-space: nowrap; position: relative; }
+  .alert-track .alert-empty { color: var(--text-dim); font-size: 13px; }
+  .alert-run { display: inline-block; white-space: nowrap; animation: alertScroll 30s linear infinite; }
+  .alert-run:hover { animation-play-state: paused; }
+  @keyframes alertScroll { from{transform:translateX(0);} to{transform:translateX(-50%);} }
+  .alert-item { display: inline-flex; align-items: center; gap: 6px; margin-right: 34px; font-size: 13px; }
+  .alert-item .a-name { color: var(--text); font-weight: 600; }
+  .alert-item .a-win { color: var(--text-dim); font-size: 11px; }
+  .alert-item.up .a-pct { color: var(--up); }
+  .alert-item.down .a-pct { color: var(--down); }
+  .alert-item .a-time { color: var(--text-dim); font-size: 11px; }
   /* 顶部栏占位 */
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -248,6 +274,12 @@
         <div class="stat clock"><span class="k">北京时间</span><span class="v" id="clock">--:--:--</span></div>
       </div>
     </header>
+
+    <!-- A4: 异动提示条 -->
+    <div class="alert-bar" id="alertBar">
+      <span class="alert-icon">🚨</span>
+      <div class="alert-track" id="alertTrack"><span class="alert-empty">盘面平静，暂无异动</span></div>
+    </div>
 
     <!-- 主区 -->
     <div class="main">
@@ -658,8 +690,53 @@
     document.querySelectorAll('.pbtn').forEach(x => x.classList.remove('active'));
     b.classList.add('active'); curPeriod = b.dataset.period; loadKline();
   }));
+
+  // A4: 异动提示条（轮询 /alerts + 跑马灯）
+  const alertBar = document.getElementById('alertBar');
+  const alertTrack = document.getElementById('alertTrack');
+  let lastAlertId = 0;
+  function fmtAlertTime(ts) {
+    const t = new Date(ts * 1000 + (new Date().getTimezoneOffset() + 480) * 60000);
+    return pad(t.getHours()) + ':' + pad(t.getMinutes());
+  }
+  function renderAlerts(items) {
+    if (!items || !items.length) {
+      alertBar.classList.remove('active');
+      alertTrack.innerHTML = '<span class="alert-empty">盘面平静，暂无异动</span>';
+      return;
+    }
+    const build = () => items.map(a => {
+      const cls = a.direction === 'up' ? 'up' : 'down';
+      const arrow = a.direction === 'up' ? '↑' : '↓';
+      const sign = a.pct > 0 ? '+' : '';
+      return '<span class="alert-item ' + cls + '">' +
+        '<span class="a-name">' + a.name + '</span>' +
+        '<span class="a-win">' + a.window + '</span>' +
+        '<span class="a-pct">' + arrow + ' ' + sign + a.pct.toFixed(2) + '%</span>' +
+        '<span class="a-time">' + fmtAlertTime(a.ts) + '</span></span>';
+    }).join('');
+    // 跑马灯需要重复一份实现无缝滚动
+    alertTrack.innerHTML = '<span class="alert-run">' + build() + build() + '</span>';
+    alertBar.classList.add('active');
+  }
+  async function refreshAlerts() {
+    try {
+      const r = await fetch('/api/finance/alerts?limit=20');
+      const d = await r.json();
+      const items = d.items || [];
+      // 有新报警时闪一下
+      if (items.length && items[0].id > lastAlertId) {
+        lastAlertId = items[0].id;
+        alertBar.style.transition = 'none';
+        alertBar.classList.add('active');
+      }
+      renderAlerts(items);
+    } catch (e) { /* 静默 */ }
+  }
+  refreshAlerts();
+  setInterval(refreshAlerts, 20000);
 </script>
-<script src="/public/cobe.js?v=12"></script>
+<script src="/public/cobe.js?v=13"></script>
 <script>
   // cobe.js 加载完后初始化（多重保障：尺寸就绪后才创建）
   function tryInitGlobe() {

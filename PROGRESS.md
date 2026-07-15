@@ -21,10 +21,28 @@
 - [ ] **S8** 本地实测（curl + 浏览器验收截图逻辑）
 - [ ] **S9** git 提交 Day2
 
-## Day 3 📋 待规划
-- [ ] K线历史数据抓取补全（当前 kline 表为空）
-- [ ] AI 盘面辅助（异动分析/个股解读）
-- [ ] 自选股增删管理 UI
+## Day 3 📋 里程碑A：异动监控报警（拆封中）
+
+> 来源：Mstock 双窗算法 + 冷却机制。只搬算法，跳过登录/CSRF/多用户安全模块。
+> 原理：每只股维护(时间,价格)历史队列 → 找N分钟前基准价 → 算涨跌速度 → 超阈值且过冷却期就报警。
+
+- [x] **A1** 建表 + 双窗异动算法（长窗180min≥5% / 短窗5min≥1% + 冷却10min）
+  - alerts表(id,symbol,name,window,pct,direction,price,ts)
+  - monitor_config表(阈值/窗口/冷却，可改)
+  - AnomalyDetector类：history队列 + price_at_or_before + should_alert(带冷却)
+  - 验收：喂模拟数据能正确判定异动+冷却
+- [x] **A2** 后台盯盘线程：轮询自选股→喂检测器→触发写alerts表
+  - 复用现有后台刷新线程的行情数据
+  - A股交易时段判断（9:30-11:30/13:00-15:00，非交易时段不误报）
+  - 验收：日志能看到"XX触发异动"
+- [x] **A3** 加腾讯行情源(stock.gtimg.cn)进多源容灾
+  - 验收：Yahoo挂时腾讯能顶上
+- [x] **A4** /api/finance/alerts + 大屏顶部异动提示条(滚动/闪烁)
+  - 验收：触发时大屏能看到提示
+- [ ] **A5** (可选)飞书/TG推送
+
+## Day 3 后续 📋 待规划（B盘中分析 / C筹码分析）
+> 见 docs/EXPANSION_PLAN.md。先做完A再定。
 
 ## 数据格式备忘
 quotes item: `{symbol,name,market,price,change_pct,change_amt,open,high,low,prev_close,volume,ts,stale?}`

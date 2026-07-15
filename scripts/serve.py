@@ -53,6 +53,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS meta(
             symbol TEXT PRIMARY KEY, last_kline_date TEXT, last_quote_ts INTEGER
         );
+        CREATE TABLE IF NOT EXISTS alerts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, name TEXT, market TEXT,
+            window TEXT, pct REAL, direction TEXT,
+            price REAL, pct_today REAL, ts INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts DESC);
+        CREATE TABLE IF NOT EXISTS monitor_config(
+            k TEXT PRIMARY KEY, v TEXT
+        );
         """)
         # 默认自选池(若空)
         n = c.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
@@ -247,6 +257,66 @@ def fetch_yahoo(symbols):
         time.sleep(0.4)
     return out
 
+def _tencent_code(sym):
+    """统一代码 -> 腾讯代码。AAPL->usAAPL, 0700.HK->hk00700"""
+    if sym.endswith('.HK'):
+        code = sym[:-3]
+        return 'hk' + code.zfill(5)
+    if sym.endswith('-USD') or sym.endswith('=X'):
+        return None  # 加密/外汇腾讯不支持，保留给DB兑底
+    # 美股（无后缀）
+    return 'us' + sym.upper()
+
+def fetch_tencent(symbols):
+    """腾讯行情源（Yahoo后路，美股/港股）。返回 GBK 编码，字段 ~ 分隔"""
+    out = {}
+    code_map = {}
+    for s in symbols:
+        tc = _tencent_code(s)
+        if tc:
+            code_map[tc] = s
+    if not code_map:
+        return out
+    try:
+        import subprocess
+        url = 'https://qt.gtimg.cn/q=' + ','.join(code_map.keys())
+        raw = subprocess.run(['curl', '-s', '--max-time', '10', url],
+                             capture_output=True, timeout=13).stdout.decode('gbk', 'ignore')
+        for line in raw.strip().split(';'):
+            line = line.strip()
+            if not line or '=' not in line:
+                continue
+            tc = line.split('=')[0].replace('v_', '').strip()
+            sym = code_map.get(tc)
+            if not sym:
+                continue
+            payload = line.split('"')[1] if '"' in line else ''
+            f = payload.split('~')
+            if len(f) < 6:
+                continue
+            try:
+                price = float(f[3]); prev = float(f[4]); openp = float(f[5])
+            except (ValueError, IndexError):
+                continue
+            if price <= 0:
+                continue
+            chg = price - prev if prev else 0
+            high = float(f[33]) if len(f) > 33 and f[33] else 0
+            low = float(f[34]) if len(f) > 34 and f[34] else 0
+            out[sym] = {
+                'symbol': sym, 'name': f[1] or sym, 'market': None,
+                'price': round(price, 4),
+                'change_pct': round((chg / prev * 100) if prev else 0, 2),
+                'change_amt': round(chg, 4),
+                'open': openp, 'high': high, 'low': low,
+                'prev_close': round(prev, 4) if prev else 0,
+                'volume': float(f[6]) if len(f) > 6 and f[6] else 0,
+                'ts': int(time.time()),
+            }
+    except Exception:
+        pass
+    return out
+
 def get_latest_from_db(symbols):
     """从DB读取最新快照（当实时抓取失败时兼底）"""
     out = {}
@@ -270,7 +340,12 @@ def fetch_quotes(symbols, fallback_db=True):
             r.update(fetch_cn_eastmoney(missing))
         result.update(r)
     if other:
-        result.update(fetch_yahoo(other))
+        r = fetch_yahoo(other)
+        # A3: Yahoo 失败的用腾讯顶上（美股/港股）
+        missing = [s for s in other if s not in r]
+        if missing:
+            r.update(fetch_tencent(missing))
+        result.update(r)
     # DB旧值兼底
     if fallback_db:
         failed = [s for s in symbols if s not in result]
@@ -307,6 +382,117 @@ def save_quotes(quotes, name_market_map=None):
             c.execute("""INSERT OR REPLACE INTO quotes
                 (symbol,name,market,price,change_pct,change_amt,open,high,low,prev_close,volume,ts)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", row)
+
+# ========== 异动检测（里程A / 移植Mstock双窗算法）==========
+MONITOR_DEFAULTS = {
+    'long_window_min': 180, 'long_threshold_pct': 5.0,
+    'short_window_min': 5, 'short_threshold_pct': 1.0,
+    'alert_cooldown_min': 10, 'enabled': 1,
+}
+
+def get_monitor_config():
+    cfg = dict(MONITOR_DEFAULTS)
+    try:
+        with db() as c:
+            for r in c.execute('SELECT k,v FROM monitor_config'):
+                k = r['k']
+                if k in cfg:
+                    cfg[k] = type(MONITOR_DEFAULTS[k])(float(r['v'])) if k != 'enabled' else int(float(r['v']))
+    except Exception:
+        pass
+    return cfg
+
+class AnomalyDetector:
+    """每只股维护(ts,price)历史队列，找N分钟前基准价→算涨跌速度→超阈且过冷却就报警"""
+    def __init__(self):
+        from collections import defaultdict, deque
+        self.history = defaultdict(lambda: deque(maxlen=2000))  # symbol -> [(ts,price)]
+        self.alerted_at = {}  # (symbol,window,direction) -> ts
+        self._lock = threading.RLock()
+
+    def prune(self, q, now, keep_sec):
+        while q and now - q[0][0] > keep_sec:
+            q.popleft()
+
+    def price_at_or_before(self, q, target_ts):
+        """找 <= target_ts 的最晚一个价格点"""
+        found = None
+        for ts, price in q:
+            if ts <= target_ts:
+                found = (ts, price)
+            else:
+                break
+        return found
+
+    def should_alert(self, symbol, window, pct, threshold, cooldown_min, now):
+        crossed = abs(pct) >= threshold
+        if not crossed:
+            return False, None
+        direction = 'up' if pct >= 0 else 'down'
+        key = (symbol, window, direction)
+        last = self.alerted_at.get(key, 0)
+        if now - last < cooldown_min * 60:
+            return False, direction
+        self.alerted_at[key] = now
+        return True, direction
+
+    def feed(self, item, now=None):
+        """喂一条行情，返回触发的异动列表 [dict]"""
+        now = now or int(time.time())
+        cfg = get_monitor_config()
+        if not cfg.get('enabled'):
+            return []
+        symbol = item.get('symbol')
+        price = float(item.get('price') or 0)
+        if not symbol or price <= 0:
+            return []
+        with self._lock:
+            q = self.history[symbol]
+            q.append((now, price))
+            keep = max(cfg['long_window_min'], cfg['short_window_min']) * 60 + 120
+            self.prune(q, now, keep)
+            out = []
+            windows = [
+                (f"{cfg['long_window_min']}分钟", cfg['long_window_min'], cfg['long_threshold_pct']),
+                (f"{cfg['short_window_min']}分钟", cfg['short_window_min'], cfg['short_threshold_pct']),
+            ]
+            for label, wmin, thr in windows:
+                base = self.price_at_or_before(q, now - wmin * 60)
+                if not base or base[1] <= 0:
+                    continue
+                pct = (price / base[1] - 1.0) * 100.0
+                ok, direction = self.should_alert(symbol, label, pct, thr, cfg['alert_cooldown_min'], now)
+                if ok:
+                    out.append({
+                        'symbol': symbol, 'name': item.get('name') or symbol,
+                        'market': item.get('market') or '', 'window': label,
+                        'pct': round(pct, 2), 'direction': direction,
+                        'price': price, 'pct_today': float(item.get('change_pct') or 0),
+                        'ts': now,
+                    })
+            return out
+
+_detector = AnomalyDetector()
+
+def is_a_share_trading_time(now=None):
+    """A股交易时段判断（9:30-11:30 / 13:00-15:00，周一至周五，北京时间）"""
+    import datetime
+    t = datetime.datetime.utcfromtimestamp(now or time.time()) + datetime.timedelta(hours=8)
+    if t.weekday() >= 5:  # 周六日
+        return False
+    hm = t.hour * 60 + t.minute
+    return (9*60+30 <= hm <= 11*60+30) or (13*60 <= hm <= 15*60)
+
+def save_alerts(alerts):
+    if not alerts:
+        return 0
+    with _db_lock, db() as c:
+        for a in alerts:
+            c.execute("""INSERT INTO alerts(symbol,name,market,window,pct,direction,price,pct_today,ts)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (a['symbol'], a['name'], a['market'], a['window'], a['pct'],
+                 a['direction'], a['price'], a['pct_today'], a['ts']))
+    return len(alerts)
 
 # ========== 历史 K 线 ==========
 def fetch_kline_eastmoney(symbol, period='daily', count=250):
@@ -410,6 +596,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_kline(q)
             if path == '/api/finance/watchlist':
                 return self._api_watchlist_get()
+            if path == '/api/finance/alerts':
+                return self._api_alerts(q)
             if path == '/' :
                 self.path = '/public/finance.html'
         except Exception as e:
@@ -443,6 +631,25 @@ class Handler(SimpleHTTPRequestHandler):
             rs = c.execute('SELECT symbol,name,market,sort_order FROM watchlist ORDER BY sort_order').fetchall()
         return self._json(200, {'ok': True, 'items': [dict(r) for r in rs]})
 
+    def _api_alerts(self, q):
+        """返回最近异动报警。since=时间戳只返回之后的；limit限数量"""
+        try:
+            since = int((q.get('since') or ['0'])[0])
+        except ValueError:
+            since = 0
+        try:
+            limit = min(int((q.get('limit') or ['30'])[0]), 100)
+        except ValueError:
+            limit = 30
+        with db() as c:
+            if since > 0:
+                rs = c.execute('SELECT * FROM alerts WHERE ts>? ORDER BY ts DESC LIMIT ?', (since, limit)).fetchall()
+            else:
+                rs = c.execute('SELECT * FROM alerts ORDER BY ts DESC LIMIT ?', (limit,)).fetchall()
+        items = [dict(r) for r in rs]
+        return self._json(200, {'ok': True, 'items': items, 'ts': int(time.time()),
+                                'trading': is_a_share_trading_time()})
+
 if __name__ == '__main__':
     init_db()
     print('DB initialized at', DB_PATH)
@@ -461,7 +668,7 @@ if __name__ == '__main__':
         save_quotes(q)
         print('saved', len(q), 'quotes to DB')
     else:
-        # 后台刷新线程：定时抓自选报价存DB（不阻塞API）
+        # 后台刷新线程：定时抓自选报价存DB（不阻塞API）+ 异动检测
         def bg_refresh():
             while True:
                 try:
@@ -469,6 +676,16 @@ if __name__ == '__main__':
                         syms = [r['symbol'] for r in c.execute('SELECT symbol FROM watchlist ORDER BY sort_order')]
                     q = fetch_quotes(syms, fallback_db=False)
                     save_quotes(q)
+                    # A2: 异动检测（仅A股交易时段，避免非交易时段误报）
+                    if is_a_share_trading_time():
+                        hits = []
+                        for s, item in q.items():
+                            hits.extend(_detector.feed(item))
+                        if hits:
+                            save_alerts(hits)
+                            for h in hits:
+                                arrow = '↑' if h['direction'] == 'up' else '↓'
+                                print(f"[异动] {h['name']}({h['symbol']}) {h['window']} {arrow}{h['pct']:+.2f}%")
                 except Exception:
                     pass
                 time.sleep(20)
