@@ -75,8 +75,20 @@ def http_get(url, headers=None, timeout=10):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode('utf-8', 'ignore')
 
+def http_get_curl(url, headers=None, timeout=12):
+    """curl 兑底：urllib 被 Yahoo 429 限流时，curl 的 TLS 指纹往往能正常返回"""
+    import subprocess
+    cmd = ['curl', '-s', '--max-time', str(int(timeout)),
+           '-H', 'User-Agent: ' + (headers or {}).get('User-Agent', UA),
+           '-H', 'Accept: application/json,text/plain,*/*',
+           '-H', 'Referer: https://finance.yahoo.com/', url]
+    out = subprocess.run(cmd, capture_output=True, timeout=timeout + 3)
+    if out.returncode != 0:
+        raise RuntimeError('curl failed rc=%d' % out.returncode)
+    return out.stdout.decode('utf-8', 'ignore')
+
 def http_get_retry(url, headers=None, timeout=12, tries=3):
-    """带 429 退避重试"""
+    """先 urllib，429/失败时退避重试；多次失败后用 curl 兑底"""
     last = None
     for i in range(tries):
         try:
@@ -86,10 +98,16 @@ def http_get_retry(url, headers=None, timeout=12, tries=3):
             if e.code == 429:
                 time.sleep(1.5 * (i + 1))  # 退避
                 continue
-            raise
+            # 非 429 的 HTTP 错误也试一次 curl
+            break
         except Exception as e:
             last = e
             time.sleep(0.8)
+    # urllib 全部失败 → curl 兑底
+    try:
+        return http_get_curl(url, headers=headers, timeout=timeout)
+    except Exception as e:
+        last = e
     if last:
         raise last
 
@@ -291,8 +309,34 @@ def save_quotes(quotes, name_market_map=None):
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", row)
 
 # ========== 历史 K 线 ==========
+def fetch_kline_eastmoney(symbol, period='daily', count=250):
+    """A股 K线走东方财富（不限流，秒回）"""
+    secid = _eastmoney_secid(symbol)
+    if not secid:
+        return []
+    klt = {'daily': '101', 'weekly': '102', 'monthly': '103'}.get(period, '101')
+    rows = []
+    try:
+        url = (f'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}'
+               f'&fields1=f1&fields2=f51,f52,f53,f54,f55,f56&klt={klt}&fqt=1&end=20500101&lmt={count}')
+        d = json.loads(http_get(url, timeout=10))
+        klines = (d.get('data') or {}).get('klines') or []
+        for line in klines:
+            p = line.split(',')
+            # f51日期 f52开 f53收 f54高 f55低 f56量
+            date, o, cl, h, l, v = p[0], float(p[1]), float(p[2]), float(p[3]), float(p[4]), float(p[5])
+            rows.append((symbol, period, date, o, h, l, cl, v))
+    except Exception:
+        pass
+    return rows
+
 def fetch_kline(symbol, period='daily', count=250):
-    """拉历史K线。A股走新浪，其余Yahoo。period: daily/weekly/monthly"""
+    """拉历史K线。A股走东财（不限流），其余Yahoo。period: daily/weekly/monthly"""
+    # A股优先东财
+    if symbol.endswith('.SS') or symbol.endswith('.SZ'):
+        rows = fetch_kline_eastmoney(symbol, period, count)
+        if rows:
+            return rows
     rng = {'daily': '1y', 'weekly': '2y', 'monthly': '5y'}.get(period, '1y')
     iv = {'daily': '1d', 'weekly': '1wk', 'monthly': '1mo'}.get(period, '1d')
     rows = []
@@ -346,6 +390,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(body)
+
+    def end_headers(self):
+        # 静态资源禁止缓存，避免浏览器加载旧版 HTML/JS
+        p = urllib.parse.urlparse(self.path).path
+        if not p.startswith('/api/'):
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+        super().end_headers()
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
@@ -421,8 +474,8 @@ if __name__ == '__main__':
                 time.sleep(20)
         t = threading.Thread(target=bg_refresh, daemon=True)
         t.start()
-        srv = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
-        print(f'FinSight serving at http://127.0.0.1:{PORT}')
+        srv = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+        print(f'FinSight serving at http://0.0.0.0:{PORT}')
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
