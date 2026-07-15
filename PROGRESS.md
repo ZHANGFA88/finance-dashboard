@@ -73,7 +73,14 @@
   - 把结构化数据喂 AI → 一段话讲清这只股
 
 ## Day 3 后续 📋 待规划（C 筹码分析）
+## Day 3 后续 📋 里程碑C 筹码分析（隔离环境）
 > 见 docs/EXPANSION_PLAN.md。akshare依赖重，独立环境隔离。
+- [x] **C1** 独立venv `.cyqenv`(项目内,gitignore) 装 akshare1.18.64/pandas/numpy/matplotlib + cyq_report.py 跑通
+  - akshare `stock_cyq_em` 返回筹码指标: 获利比例/平均成本/90-70成本区间/集中度 + 近30日序列
+  - 验收: `600206` 输出真实数据(获利5.81%/均本55.82/90成本区45.63-63.63) ✅
+  - ⚠️ 坑: requests 继承 macOS 系统代理连东财失败, 必须带 `no_proxy='*'` 强制直连(C2 subprocess 也要带)
+- [ ] **C2** 主后端 /api/finance/cyq?symbol= subprocess 调 .cyqenv, 返回筹码JSON(带缓存)
+- [ ] **C3** K线弹窗加第三Tab「筹码」: 成本区间带状图 + 获利盘/集中度指标
 
 ## 数据格式备忘
 quotes item: `{symbol,name,market,price,change_pct,change_amt,open,high,low,prev_close,volume,ts,stale?}`
