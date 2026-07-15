@@ -255,6 +255,51 @@
   #klineCanvas { width: 100%; height: 380px; display: block; }
   .kloading { position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; color: var(--text-dim); font-size: 14px; }
+  /* B4 分析面板 Tab */
+  .mtabs { display: flex; gap: 8px; padding: 10px 20px 0; border-bottom: 1px solid var(--border); }
+  .mtab { background: none; border: none; border-bottom: 2px solid transparent;
+    color: var(--text-dim); font-size: 13px; padding: 8px 4px; cursor: pointer; }
+  .mtab.active { color: var(--gold); border-bottom-color: var(--gold); }
+  .tab-pane { display: none; }
+  .tab-pane.show { display: block; }
+  .an-loading { display: flex; align-items: center; justify-content: center;
+    min-height: 200px; color: var(--text-dim); font-size: 14px; }
+  .an-content { font-size: 13px; }
+  .an-verdict { display: flex; align-items: center; gap: 14px; padding: 14px 16px;
+    border-radius: 10px; background: rgba(255,255,255,0.03); border: 1px solid var(--border); margin-bottom: 14px; }
+  .an-stance { font-size: 22px; font-weight: 800; }
+  .an-stance.bull { color: var(--up); }
+  .an-stance.bear { color: var(--down); }
+  .an-stance.neutral { color: var(--gold); }
+  .an-meta { display: flex; flex-direction: column; gap: 3px; color: var(--text-dim); font-size: 12px; }
+  .an-meta b { color: var(--text); font-size: 13px; }
+  .an-bars { margin-left: auto; display: flex; gap: 16px; text-align: center; }
+  .an-bar-lab { font-size: 11px; color: var(--text-dim); }
+  .an-bar-val { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .an-bar-val.bull { color: var(--up); }
+  .an-bar-val.bear { color: var(--down); }
+  .an-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .an-col h4 { font-size: 12px; margin: 0 0 8px; color: var(--text-dim); font-weight: 600; }
+  .an-col.bull h4 { color: var(--up); }
+  .an-col.bear h4 { color: var(--down); }
+  .an-fac { list-style: none; margin: 0; padding: 0; }
+  .an-fac li { padding: 5px 8px; margin-bottom: 5px; border-radius: 6px; font-size: 12px;
+    background: rgba(255,255,255,0.03); line-height: 1.4; }
+  .an-col.bull .an-fac li { border-left: 2px solid var(--up); }
+  .an-col.bear .an-fac li { border-left: 2px solid var(--down); }
+  .an-sec { margin-bottom: 12px; }
+  .an-sec h4 { font-size: 12px; margin: 0 0 8px; color: var(--text-dim); font-weight: 600; }
+  .an-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px,1fr)); gap: 8px; }
+  .an-cell { padding: 8px 10px; border-radius: 7px; background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border); }
+  .an-cell .cl { font-size: 10px; color: var(--text-dim); display: block; margin-bottom: 3px; }
+  .an-cell .cv { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .an-cell .cv.up { color: var(--up); } .an-cell .cv.down { color: var(--down); }
+  .an-signals { list-style: none; margin: 0; padding: 0; }
+  .an-signals li { padding: 7px 10px; margin-bottom: 6px; border-radius: 6px; font-size: 12px;
+    background: rgba(212,175,90,0.08); border-left: 2px solid var(--gold); line-height: 1.45; }
+  .an-env { font-size: 12px; color: var(--text-dim); }
+  .an-env b { color: var(--text); }
 </style>
 </head>
 <body>
@@ -332,9 +377,19 @@
         </div>
         <button class="mclose" id="kClose">✕</button>
       </div>
+      <div class="mtabs">
+        <button class="mtab active" data-tab="chart">📈 K线</button>
+        <button class="mtab" data-tab="analyze">🔍 深度分析</button>
+      </div>
       <div class="modal-body">
-        <canvas id="klineCanvas"></canvas>
-        <div class="kloading" id="kLoading">K线加载中…</div>
+        <div class="tab-pane show" id="paneChart">
+          <canvas id="klineCanvas"></canvas>
+          <div class="kloading" id="kLoading">K线加载中…</div>
+        </div>
+        <div class="tab-pane" id="paneAnalyze">
+          <div class="an-loading" id="anLoading">分析加载中…</div>
+          <div class="an-content" id="anContent" style="display:none"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -612,9 +667,92 @@
       kHead.className = 'modal-head ' + (pct>0?'up':(pct<0?'down':''));
     }
     modal.classList.add('show');
+    switchTab('chart');
+    anLoaded = null;
     loadKline();
   }
   function closeKline() { modal.classList.remove('show'); }
+
+  // B4: Tab 切换
+  let anLoaded = null; // 已加载分析的 symbol
+  function switchTab(tab) {
+    document.querySelectorAll('.mtab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+    document.getElementById('paneChart').classList.toggle('show', tab === 'chart');
+    document.getElementById('paneAnalyze').classList.toggle('show', tab === 'analyze');
+    if (tab === 'analyze' && anLoaded !== curSymbol) loadAnalyze();
+  }
+
+  async function loadAnalyze() {
+    const anLoading = document.getElementById('anLoading');
+    const anContent = document.getElementById('anContent');
+    anLoading.style.display = 'flex'; anLoading.textContent = '分析加载中…';
+    anContent.style.display = 'none';
+    try {
+      const r = await fetch('/api/finance/analyze?symbol=' + encodeURIComponent(curSymbol) + '&period=daily');
+      const d = await r.json();
+      if (!d.ok) { anLoading.textContent = d.error === 'insufficient kline' ? '数据不足，无法分析' : ('分析失败: ' + (d.error||'')); return; }
+      anLoaded = curSymbol;
+      anLoading.style.display = 'none';
+      anContent.style.display = 'block';
+      anContent.innerHTML = renderAnalyze(d);
+    } catch (e) {
+      anLoading.textContent = '分析加载失败';
+    }
+  }
+
+  function renderAnalyze(d) {
+    const a = d.analysis || {}, ind = d.indicators || {};
+    const bullStance = ['多头主导','偏多'].includes(a.stance);
+    const bearStance = ['空头主导','偏空'].includes(a.stance);
+    const scls = bullStance ? 'bull' : (bearStance ? 'bear' : 'neutral');
+    const ma = ind.ma || {}, macd = ind.macd || {}, kdj = ind.kdj || {}, vol = ind.volume || {}, hl = ind.high_low || {};
+    const cp = ind.change_pct || 0;
+    const cell = (lab, val, cls) => '<div class="an-cell"><span class="cl">' + lab + '</span><span class="cv ' + (cls||'') + '">' + val + '</span></div>';
+    const nz = v => (v==null? '--' : v);
+    let html = '';
+    // 结论
+    html += '<div class="an-verdict">' +
+      '<div class="an-stance ' + scls + '">' + (a.stance||'--') + '</div>' +
+      '<div class="an-meta">' +
+        '<span>强度 <b>' + (a.strength||'--') + '</b></span>' +
+        '<span>' + (a.divergence_desc||'') + ' (分歧度 ' + (a.divergence!=null?a.divergence:'--') + ')</span>' +
+      '</div>' +
+      '<div class="an-bars">' +
+        '<div><div class="an-bar-lab">多头</div><div class="an-bar-val bull">' + (a.bull_score!=null?a.bull_score:'-') + '</div></div>' +
+        '<div><div class="an-bar-lab">空头</div><div class="an-bar-val bear">' + (a.bear_score!=null?a.bear_score:'-') + '</div></div>' +
+      '</div>' +
+    '</div>';
+    // 多空因子双栏
+    const facLi = arr => (arr && arr.length) ? arr.map(x => '<li>' + x + '</li>').join('') : '<li style="opacity:.5">无</li>';
+    html += '<div class="an-cols">' +
+      '<div class="an-col bull"><h4>↑ 多头力量</h4><ul class="an-fac">' + facLi(a.bull_factors) + '</ul></div>' +
+      '<div class="an-col bear"><h4>↓ 空头抛压</h4><ul class="an-fac">' + facLi(a.bear_factors) + '</ul></div>' +
+    '</div>';
+    // 技术面指标
+    html += '<div class="an-sec"><h4>技术面</h4><div class="an-grid">' +
+      cell('现价', nz(ind.close), cp>0?'up':(cp<0?'down':'')) +
+      cell('涨跌幅', (cp>0?'+':'') + cp.toFixed(2) + '%', cp>0?'up':(cp<0?'down':'')) +
+      cell('MA20', nz(ma.MA20)) + cell('MA60', nz(ma.MA60)) +
+      cell('MACD', (macd.gold_cross?'金叉 ':(macd.dead_cross?'死叉 ':'')) + nz(macd.MACD)) +
+      cell('KDJ-J', nz(kdj.J) + (kdj.signal==='overbought'?' 超买':(kdj.signal==='oversold'?' 超卖':''))) +
+      cell('RSI14', nz(ind.rsi)) +
+      cell('量比5日', nz(vol.vol_ratio_5)) +
+      cell('近20日高', nz(hl.high_20)) + cell('近20日低', nz(hl.low_20)) +
+    '</div></div>';
+    // 大盘环境
+    const env = d.market_env || {};
+    html += '<div class="an-sec"><h4>大盘环境</h4><div class="an-env">当前走势：<b>' + (env.trend||'--') + '</b>';
+    if (env.indices && env.indices.length) {
+      html += '　' + env.indices.map(i => i.name + ' ' + (i.change_pct>0?'+':'') + i.change_pct + '%').join('　');
+    }
+    html += '</div></div>';
+    // 次日验证信号
+    if (a.verify_signals && a.verify_signals.length) {
+      html += '<div class="an-sec"><h4>次日验证信号</h4><ul class="an-signals">' +
+        a.verify_signals.map(s => '<li>' + s + '</li>').join('') + '</ul></div>';
+    }
+    return html;
+  }
 
   async function loadKline() {
     kLoading.style.display = 'flex'; kLoading.textContent = 'K线加载中…';
@@ -690,6 +828,7 @@
     document.querySelectorAll('.pbtn').forEach(x => x.classList.remove('active'));
     b.classList.add('active'); curPeriod = b.dataset.period; loadKline();
   }));
+  document.querySelectorAll('.mtab').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
 
   // A4: 异动提示条（轮询 /alerts + 跑马灯）
   const alertBar = document.getElementById('alertBar');

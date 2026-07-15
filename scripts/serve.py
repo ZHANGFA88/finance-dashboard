@@ -505,7 +505,7 @@ def fetch_kline_eastmoney(symbol, period='daily', count=250):
     try:
         url = (f'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}'
                f'&fields1=f1&fields2=f51,f52,f53,f54,f55,f56&klt={klt}&fqt=1&end=20500101&lmt={count}')
-        d = json.loads(http_get(url, timeout=10))
+        d = json.loads(http_get_retry(url, timeout=10))
         klines = (d.get('data') or {}).get('klines') or []
         for line in klines:
             p = line.split(',')
@@ -557,6 +557,423 @@ def get_kline_db(symbol, period='daily', limit=250):
                        (symbol, period, limit)).fetchall()
     return [dict(r) for r in reversed(rs)]
 
+# ========== 技术指标引擎（里程B1 / 纯Python无依赖）==========
+def _ema(vals, n):
+    """指数移动平均"""
+    if not vals:
+        return []
+    k = 2.0 / (n + 1)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+def _sma(vals, n):
+    """简单移动平均，返回与vals等长(不足n的位置为None)"""
+    out = []
+    s = 0.0
+    from collections import deque
+    q = deque()
+    for v in vals:
+        q.append(v); s += v
+        if len(q) > n:
+            s -= q.popleft()
+        out.append(s / len(q) if len(q) == n else None)
+    return out
+
+def calc_ma(closes, periods=(5, 10, 20, 60, 120)):
+    """均线：取每条均线的最新值"""
+    out = {}
+    for p in periods:
+        if len(closes) >= p:
+            out['MA%d' % p] = round(sum(closes[-p:]) / p, 3)
+        else:
+            out['MA%d' % p] = None
+    return out
+
+def calc_macd(closes, fast=12, slow=26, signal=9):
+    """MACD: DIF/DEA/柱体(MACD)"""
+    if len(closes) < slow:
+        return {'DIF': None, 'DEA': None, 'MACD': None, 'trend': None}
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    dif = [f - s for f, s in zip(ema_fast, ema_slow)]
+    dea = _ema(dif, signal)
+    macd = [(d - e) * 2 for d, e in zip(dif, dea)]
+    # 趋势：柱体较前日变化
+    trend = None
+    if len(macd) >= 2:
+        trend = 'up' if macd[-1] > macd[-2] else ('down' if macd[-1] < macd[-2] else 'flat')
+    return {'DIF': round(dif[-1], 3), 'DEA': round(dea[-1], 3),
+            'MACD': round(macd[-1], 3), 'trend': trend,
+            'gold_cross': dif[-1] > dea[-1] and (len(dif) >= 2 and dif[-2] <= dea[-2]),
+            'dead_cross': dif[-1] < dea[-1] and (len(dif) >= 2 and dif[-2] >= dea[-2])}
+
+def calc_kdj(highs, lows, closes, n=9, m1=3, m2=3):
+    """KDJ"""
+    if len(closes) < n:
+        return {'K': None, 'D': None, 'J': None, 'signal': None}
+    rsv = []
+    for i in range(len(closes)):
+        lo = min(lows[max(0, i - n + 1):i + 1])
+        hi = max(highs[max(0, i - n + 1):i + 1])
+        rsv.append((closes[i] - lo) / (hi - lo) * 100 if hi > lo else 50.0)
+    k = [50.0]; d = [50.0]
+    for i in range(1, len(rsv)):
+        k.append((m1 - 1) / m1 * k[-1] + 1.0 / m1 * rsv[i])
+        d.append((m2 - 1) / m2 * d[-1] + 1.0 / m2 * k[-1])
+    j = [3 * k[i] - 2 * d[i] for i in range(len(k))]
+    kv, dv, jv = k[-1], d[-1], j[-1]
+    sig = None
+    if len(k) >= 2:
+        if k[-1] > d[-1] and k[-2] <= d[-2]:
+            sig = 'gold_cross'
+        elif k[-1] < d[-1] and k[-2] >= d[-2]:
+            sig = 'dead_cross'
+        elif jv > 100 or kv > 80:
+            sig = 'overbought'
+        elif jv < 0 or kv < 20:
+            sig = 'oversold'
+    return {'K': round(kv, 2), 'D': round(dv, 2), 'J': round(jv, 2), 'signal': sig}
+
+def calc_rsi(closes, n=14):
+    """RSI14"""
+    if len(closes) < n + 1:
+        return None
+    gains = []; losses = []
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0)); losses.append(max(-ch, 0))
+    # 首个n日均值，后续Wilder平滑
+    ag = sum(gains[:n]) / n; al = sum(losses[:n]) / n
+    for i in range(n, len(gains)):
+        ag = (ag * (n - 1) + gains[i]) / n
+        al = (al * (n - 1) + losses[i]) / n
+    if al == 0:
+        return 100.0
+    rs = ag / al
+    return round(100 - 100 / (1 + rs), 2)
+
+def calc_volume_stats(klines):
+    """量能：当日量、相对5日/20日均量比"""
+    vols = [k['volume'] for k in klines]
+    if not vols:
+        return {}
+    today = vols[-1]
+    ma5 = sum(vols[-5:]) / min(5, len(vols))
+    ma20 = sum(vols[-20:]) / min(20, len(vols))
+    return {
+        'volume': round(today, 1),
+        'vol_ratio_5': round(today / ma5, 2) if ma5 else None,
+        'vol_ratio_20': round(today / ma20, 2) if ma20 else None,
+    }
+
+def calc_high_low(klines, periods=(20, 60)):
+    """近N日高低点"""
+    out = {}
+    for p in periods:
+        seg = klines[-p:] if len(klines) >= p else klines
+        if seg:
+            out['high_%d' % p] = round(max(k['high'] for k in seg), 3)
+            out['low_%d' % p] = round(min(k['low'] for k in seg), 3)
+    return out
+
+def compute_indicators(klines):
+    """聚合所有技术指标。输入 K线列表(按日期升序)"""
+    if not klines or len(klines) < 2:
+        return {'ok': False, 'error': 'insufficient kline'}
+    closes = [k['close'] for k in klines]
+    highs = [k['high'] for k in klines]
+    lows = [k['low'] for k in klines]
+    last = klines[-1]
+    prev_close = klines[-2]['close']
+    change_pct = round((last['close'] / prev_close - 1) * 100, 2) if prev_close else 0
+    return {
+        'ok': True,
+        'date': last['date'],
+        'close': last['close'],
+        'change_pct': change_pct,
+        'ma': calc_ma(closes),
+        'macd': calc_macd(closes),
+        'kdj': calc_kdj(highs, lows, closes),
+        'rsi': calc_rsi(closes),
+        'volume': calc_volume_stats(klines),
+        'high_low': calc_high_low(klines),
+    }
+
+# ========== 大盘环境 + 板块热点（里程B2）==========
+INDEX_MAP = [
+    ('s_sh000001', '上证指数'),
+    ('s_sz399001', '深证成指'),
+    ('s_sz399006', '创业板指'),
+    ('s_sh000688', '科创50'),
+]
+
+def fetch_indices():
+    """四大指数当日涨跌（新浪轻量接口，curl拿原始GBK字节）"""
+    codes = ','.join(c for c, _ in INDEX_MAP)
+    out = []
+    try:
+        import subprocess
+        url = 'https://hq.sinajs.cn/list=' + codes
+        raw = subprocess.run(['curl', '-s', '--max-time', '8',
+                              '-H', 'Referer: https://finance.sina.com.cn',
+                              '-H', 'User-Agent: ' + UA, url],
+                             capture_output=True, timeout=11).stdout.decode('gbk', 'ignore')
+        for line in raw.strip().split(';'):
+            line = line.strip()
+            if '="' not in line:
+                continue
+            code = line.split('_')[-1].split('=')[0].strip()
+            payload = line.split('"')[1] if '"' in line else ''
+            f = payload.split(',')
+            if len(f) < 4:
+                continue
+            try:
+                price = float(f[1]); chg = float(f[2]); pct = float(f[3])
+            except ValueError:
+                continue
+            out.append({
+                'code': code, 'name': f[0] or code,
+                'price': round(price, 2), 'change_amt': round(chg, 2), 'change_pct': round(pct, 2),
+            })
+    except Exception:
+        pass
+    return out
+
+def fetch_sectors(kind='concept', limit=10):
+    """板块涨幅榜+资金流。kind: concept(概念 t:3) / industry(行业 t:2)，curl拉+重试"""
+    t = '3' if kind == 'concept' else '2'
+    url = (f'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz={limit}&po=1&fid=f3'
+           f'&fs=m:90+t:{t}&fields=f12,f14,f3,f62,f104,f105')
+    for attempt in range(3):
+        out = []
+        try:
+            import subprocess
+            raw = subprocess.run(['curl', '-s', '--max-time', '10', url],
+                                 capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+            d = json.loads(raw)
+            diff = (d.get('data') or {}).get('diff') or {}
+            rows = diff.values() if isinstance(diff, dict) else diff
+            for r in rows:
+                pct_raw = r.get('f3')
+                out.append({
+                    'code': r.get('f12'), 'name': r.get('f14'),
+                    'change_pct': round(float(pct_raw) / 100.0, 2) if pct_raw not in (None, '-') else 0,
+                    'main_inflow': r.get('f62'),
+                    'up_count': r.get('f104'), 'down_count': r.get('f105'),
+                })
+            if out:
+                return out
+        except Exception:
+            pass
+        time.sleep(1.2 * (attempt + 1))  # 退避重试
+    return out
+
+_idx_cache = {'data': None, 'ts': 0}
+def _index_cache_get(ttl=30):
+    """大盘四大指数带缓存(默认30s)，避免 analyze 频繁拉新浪"""
+    now = time.time()
+    if _idx_cache['data'] is not None and now - _idx_cache['ts'] < ttl:
+        return _idx_cache['data']
+    idx = fetch_indices()
+    if idx:
+        _idx_cache['data'] = idx; _idx_cache['ts'] = now
+    return idx or (_idx_cache['data'] or [])
+
+def classify_index_trend(idx):
+    """大盘定性：由四大指数当日涨跌粗判"""
+    if not idx:
+        return 'unknown'
+    avg = sum(i['change_pct'] for i in idx) / len(idx)
+    if avg >= 1.5:
+        return '强势上涨'
+    if avg >= 0.3:
+        return '温和上涨'
+    if avg > -0.3:
+        return '震荡整理'
+    if avg > -1.5:
+        return '较弱下跌'
+    return '大幅下跌'
+
+# ========== 多空分歧判断框架（里程B3 / 纯Python无依赖）==========
+def judge_bull_bear(ind, klines, index_env=None, sector_env=None):
+    """输入 B1指标(compute_indicators结果) + 原始K线(算影线/位置) → 输出结构化多空判断。
+    index_env: fetch_indices() 后 classify_index_trend 的定性字符串(可选)。
+    sector_env: 该股所属板块的涨幅/资金流字典(可选)，形如 {'name','change_pct','main_inflow'}。
+    """
+    if not ind or not ind.get('ok') or not klines:
+        return {'ok': False, 'error': 'insufficient data'}
+
+    last = klines[-1]
+    o, h, l, c = last['open'], last['high'], last['low'], last['close']
+    change_pct = ind.get('change_pct', 0) or 0
+    ma = ind.get('ma') or {}
+    macd = ind.get('macd') or {}
+    kdj = ind.get('kdj') or {}
+    rsi = ind.get('rsi')
+    vol = ind.get('volume') or {}
+    hl = ind.get('high_low') or {}
+
+    bull, bear = [], []          # 多头/空头信号说明
+    bull_score = bear_score = 0  # 量化力量
+
+    # 1) 当日涨跌幅
+    if change_pct >= 5:
+        bull_score += 2; bull.append('大涨%.2f%%，多头强势' % change_pct)
+    elif change_pct >= 1:
+        bull_score += 1; bull.append('上涨%.2f%%' % change_pct)
+    elif change_pct <= -5:
+        bear_score += 2; bear.append('大跌%.2f%%，空头占优' % change_pct)
+    elif change_pct <= -1:
+        bear_score += 1; bear.append('下跌%.2f%%' % change_pct)
+
+    # 2) K线形态：实体与上下影线
+    rng = (h - l) or 1e-9
+    body = c - o
+    upper = h - max(o, c)   # 上影线
+    lower = min(o, c) - l   # 下影线
+    body_ratio = abs(body) / rng
+    if body > 0 and body_ratio >= 0.6:
+        bull_score += 1; bull.append('大阳线实体饱满(实体占比%.0f%%)' % (body_ratio * 100))
+    elif body < 0 and body_ratio >= 0.6:
+        bear_score += 1; bear.append('大阴线实体饱满(实体占比%.0f%%)' % (body_ratio * 100))
+    if lower / rng >= 0.35 and lower > abs(body):
+        bull_score += 1; bull.append('长下影线，下方承接有力')
+    if upper / rng >= 0.35 and upper > abs(body):
+        bear_score += 1; bear.append('长上影线，上方抛压明显')
+
+    # 3) 均线位置
+    ma20 = ma.get('MA20'); ma60 = ma.get('MA60')
+    if ma20:
+        if c > ma20:
+            bull_score += 1; bull.append('站上20日线(%.2f)' % ma20)
+        else:
+            bear_score += 1; bear.append('跌破20日线(%.2f)' % ma20)
+    if ma20 and ma60 and ma20 > ma60:
+        bull_score += 1; bull.append('20日线上穿60日线，中期多头排列')
+    elif ma20 and ma60 and ma20 < ma60:
+        bear_score += 1; bear.append('20日线位于60日线下方，中期偏空')
+
+    # 4) MACD
+    if macd.get('gold_cross'):
+        bull_score += 2; bull.append('MACD金叉')
+    elif macd.get('dead_cross'):
+        bear_score += 2; bear.append('MACD死叉')
+    elif macd.get('trend') == 'up':
+        bull_score += 1; bull.append('MACD红柱走强')
+    elif macd.get('trend') == 'down':
+        bear_score += 1; bear.append('MACD柱体走弱')
+
+    # 5) KDJ
+    ksig = kdj.get('signal')
+    if ksig == 'gold_cross':
+        bull_score += 1; bull.append('KDJ金叉')
+    elif ksig == 'dead_cross':
+        bear_score += 1; bear.append('KDJ死叉')
+    elif ksig == 'overbought':
+        bear_score += 1; bear.append('KDJ超买(J=%.0f)，短线过热' % (kdj.get('J') or 0))
+    elif ksig == 'oversold':
+        bull_score += 1; bull.append('KDJ超卖(J=%.0f)，短线或反弹' % (kdj.get('J') or 0))
+
+    # 6) RSI
+    if rsi is not None:
+        if rsi >= 80:
+            bear_score += 1; bear.append('RSI=%.0f 超买' % rsi)
+        elif rsi >= 55:
+            bull_score += 1; bull.append('RSI=%.0f 偏强' % rsi)
+        elif rsi <= 20:
+            bull_score += 1; bull.append('RSI=%.0f 超卖，或有反弹' % rsi)
+        elif rsi <= 45:
+            bear_score += 1; bear.append('RSI=%.0f 偏弱' % rsi)
+
+    # 7) 量能
+    vr5 = vol.get('vol_ratio_5')
+    if vr5:
+        if vr5 >= 1.5 and change_pct > 0:
+            bull_score += 1; bull.append('放量上涨(量比5日=%.2f)，资金进场' % vr5)
+        elif vr5 >= 1.5 and change_pct < 0:
+            bear_score += 1; bear.append('放量下跌(量比5日=%.2f)，抛压释放' % vr5)
+        elif vr5 <= 0.7 and change_pct > 0:
+            bear.append('缩量上涨(量比5日=%.2f)，上攻动能存疑' % vr5)
+
+    # 8) 突破/跌破近期高低点
+    hi20 = hl.get('high_20'); lo20 = hl.get('low_20')
+    if hi20 and c >= hi20:
+        bull_score += 2; bull.append('创近20日新高，突破有效')
+    if lo20 and c <= lo20:
+        bear_score += 2; bear.append('创近20日新低，跌破支撑')
+
+    # 9) 大盘环境加成
+    if index_env:
+        if index_env in ('强势上涨', '温和上涨'):
+            bull_score += 1; bull.append('大盘%s，环境偏暖' % index_env)
+        elif index_env in ('较弱下跌', '大幅下跌'):
+            bear_score += 1; bear.append('大盘%s，环境承压' % index_env)
+
+    # 10) 所属板块强弱
+    if sector_env and sector_env.get('change_pct') is not None:
+        spct = sector_env['change_pct']
+        sname = sector_env.get('name', '所属板块')
+        if spct >= 2:
+            bull_score += 1; bull.append('%s板块大涨%.2f%%，热点助攻' % (sname, spct))
+        elif spct <= -2:
+            bear_score += 1; bear.append('%s板块走弱%.2f%%，拖累明显' % (sname, spct))
+
+    # ===== 综合判定 =====
+    total = bull_score + bear_score
+    diff = bull_score - bear_score
+    if total == 0:
+        stance = '多空平衡'; strength = '弱'
+    elif diff >= 4:
+        stance = '多头主导'; strength = '强'
+    elif diff >= 2:
+        stance = '偏多'; strength = '中'
+    elif diff <= -4:
+        stance = '空头主导'; strength = '强'
+    elif diff <= -2:
+        stance = '偏空'; strength = '中'
+    else:
+        stance = '多空分歧'; strength = '中' if total >= 4 else '弱'
+
+    # 分歧度：双方都有相当力量 → 分歧大
+    divergence = round(min(bull_score, bear_score) / (total or 1), 2)
+    if divergence >= 0.4:
+        divergence_desc = '分歧较大，方向不明'
+    elif divergence >= 0.2:
+        divergence_desc = '存在分歧'
+    else:
+        divergence_desc = '方向较一致'
+
+    # 次日验证信号：给出可观察的确认/证伪价位
+    signals = []
+    if stance in ('多头主导', '偏多'):
+        if hi20:
+            signals.append('次日站稳%.2f(近20日高)并放量则确认上攻' % hi20)
+        if ma20:
+            signals.append('若回落跌破MA20(%.2f)则多头减弱' % ma20)
+    elif stance in ('空头主导', '偏空'):
+        if lo20:
+            signals.append('次日跌破%.2f(近20日低)则下跌加速' % lo20)
+        if ma20:
+            signals.append('若反弹收复MA20(%.2f)则空头趋缓' % ma20)
+    else:
+        if ma20:
+            signals.append('关注MA20(%.2f)争夺：上破偏多、下破偏空' % ma20)
+
+    return {
+        'ok': True,
+        'stance': stance,           # 多头主导/偏多/多空分歧/偏空/空头主导/多空平衡
+        'strength': strength,       # 强/中/弱
+        'bull_score': bull_score,
+        'bear_score': bear_score,
+        'divergence': divergence,
+        'divergence_desc': divergence_desc,
+        'bull_factors': bull,
+        'bear_factors': bear,
+        'verify_signals': signals,
+    }
+
 # ========== HTTP 服务 ==========
 _quote_cache = {'data': None, 'ts': 0}
 QUOTE_TTL = 8  # 秒
@@ -598,6 +1015,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_watchlist_get()
             if path == '/api/finance/alerts':
                 return self._api_alerts(q)
+            if path == '/api/finance/analyze':
+                return self._api_analyze(q)
             if path == '/' :
                 self.path = '/public/finance.html'
         except Exception as e:
@@ -649,6 +1068,40 @@ class Handler(SimpleHTTPRequestHandler):
         items = [dict(r) for r in rs]
         return self._json(200, {'ok': True, 'items': items, 'ts': int(time.time()),
                                 'trading': is_a_share_trading_time()})
+
+    def _api_analyze(self, q):
+        """B4: 聚合 B1指标 + B2大盘/板块 + B3多空判断，返回结构化技术面解读"""
+        symbol = (q.get('symbol') or [''])[0]
+        if not symbol:
+            return self._json(400, {'ok': False, 'error': 'symbol required'})
+        period = (q.get('period') or ['daily'])[0]
+        # K线（优先DB，缺则拉取）
+        rows = get_kline_db(symbol, period)
+        if not rows or len(rows) < 30:
+            save_kline(fetch_kline(symbol, period))
+            rows = get_kline_db(symbol, period)
+        ind = compute_indicators(rows)
+        if not ind.get('ok'):
+            return self._json(200, {'ok': False, 'error': 'insufficient kline', 'symbol': symbol})
+        # 股票名称/市场
+        name = symbol
+        with db() as c:
+            r = c.execute('SELECT name,market FROM watchlist WHERE symbol=?', (symbol,)).fetchone()
+            if r:
+                name = r['name'] or symbol
+        # 大盘环境（带8秒缓存）
+        idx = _index_cache_get()
+        index_trend = classify_index_trend(idx)
+        # 板块（仅A股参考概念涨幅榜首位作为环境，不做个股精确映射）
+        sector_env = None
+        analysis = judge_bull_bear(ind, rows, index_env=index_trend, sector_env=sector_env)
+        return self._json(200, {
+            'ok': True, 'symbol': symbol, 'name': name, 'period': period,
+            'indicators': ind,
+            'market_env': {'trend': index_trend, 'indices': idx},
+            'analysis': analysis,
+            'ts': int(time.time()),
+        })
 
 if __name__ == '__main__':
     init_db()
