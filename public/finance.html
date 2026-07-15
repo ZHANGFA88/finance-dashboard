@@ -305,6 +305,14 @@
     border: 1px solid rgba(212,175,90,0.25); }
   .an-nr-tag { display: inline-block; margin-right: 8px; padding: 1px 8px; border-radius: 5px;
     font-size: 11px; color: #1a1206; background: var(--gold); font-weight: 700; vertical-align: middle; }
+  /* C3 筹码面板 */
+  .cyq-metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px,1fr)); gap: 8px; margin-bottom: 14px; }
+  .cyq-metrics .an-cell { padding: 8px 10px; border-radius: 7px; background: rgba(255,255,255,0.03); border: 1px solid var(--border); }
+  .cyq-metrics .cl { font-size: 10px; color: var(--text-dim); display: block; margin-bottom: 3px; }
+  .cyq-metrics .cv { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .cyq-metrics .cv.up { color: var(--up); } .cyq-metrics .cv.down { color: var(--down); }
+  #cyqCanvas { width: 100%; height: 300px; display: block; }
+  .cyq-note { margin-top: 8px; font-size: 11px; color: var(--text-dim); line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -385,6 +393,7 @@
       <div class="mtabs">
         <button class="mtab active" data-tab="chart">📈 K线</button>
         <button class="mtab" data-tab="analyze">🔍 深度分析</button>
+        <button class="mtab" data-tab="cyq">🎰 筹码</button>
       </div>
       <div class="modal-body">
         <div class="tab-pane show" id="paneChart">
@@ -394,6 +403,14 @@
         <div class="tab-pane" id="paneAnalyze">
           <div class="an-loading" id="anLoading">分析加载中…</div>
           <div class="an-content" id="anContent" style="display:none"></div>
+        </div>
+        <div class="tab-pane" id="paneCyq">
+          <div class="an-loading" id="cyqLoading">筹码加载中…</div>
+          <div class="cyq-content" id="cyqContent" style="display:none">
+            <div class="cyq-metrics" id="cyqMetrics"></div>
+            <canvas id="cyqCanvas"></canvas>
+            <div class="cyq-note">数据来源：东财筹码分布（T+1 盘后更新）。成本区间带为 90% 筹码分布，无日K线标注</div>
+          </div>
         </div>
       </div>
     </div>
@@ -674,17 +691,111 @@
     modal.classList.add('show');
     switchTab('chart');
     anLoaded = null;
+    cyqLoaded = null;
     loadKline();
   }
   function closeKline() { modal.classList.remove('show'); }
 
   // B4: Tab 切换
   let anLoaded = null; // 已加载分析的 symbol
+  let cyqLoaded = null; // 已加载筹码的 symbol
   function switchTab(tab) {
     document.querySelectorAll('.mtab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     document.getElementById('paneChart').classList.toggle('show', tab === 'chart');
     document.getElementById('paneAnalyze').classList.toggle('show', tab === 'analyze');
+    document.getElementById('paneCyq').classList.toggle('show', tab === 'cyq');
     if (tab === 'analyze' && anLoaded !== curSymbol) loadAnalyze();
+    if (tab === 'cyq' && cyqLoaded !== curSymbol) loadCyq();
+  }
+
+  async function loadCyq() {
+    const ld = document.getElementById('cyqLoading');
+    const ct = document.getElementById('cyqContent');
+    ld.style.display = 'flex'; ld.textContent = '筹码加载中…（东财数据源，首次可能稍慢）';
+    ct.style.display = 'none';
+    try {
+      const r = await fetch('/api/finance/cyq?symbol=' + encodeURIComponent(curSymbol));
+      const d = await r.json();
+      if (!d.ok) {
+        ld.textContent = (d.error && d.error.indexOf('cyq env missing') >= 0) ? '筹码环境未就绪（.cyqenv 未建）'
+          : (d.error && (d.error.indexOf('aborted') >= 0 || d.error.indexOf('timeout') >= 0)) ? '东财数据源繁忙，请稍后重试'
+          : ('暂无筹码数据' + (d.code ? '（仅支持A股，当前 ' + d.code + '）' : ''));
+        return;
+      }
+      cyqLoaded = curSymbol;
+      ld.style.display = 'none';
+      ct.style.display = 'block';
+      renderCyq(d);
+    } catch (e) {
+      ld.textContent = '筹码加载失败';
+    }
+  }
+
+  function renderCyq(d) {
+    const m = document.getElementById('cyqMetrics');
+    const pr = d.profit_ratio_pct;
+    const prCls = pr == null ? '' : (pr >= 50 ? 'up' : 'down');
+    const cell = (lab, val, cls) => '<div class="an-cell"><span class="cl">' + lab + '</span><span class="cv ' + (cls||'') + '">' + val + '</span></div>';
+    const nz = v => (v==null? '--' : v);
+    m.innerHTML =
+      cell('获利盘', pr!=null? pr+'%' : '--', prCls) +
+      cell('平均成本', nz(d.avg_cost)) +
+      cell('90%成本区', (d.cost_90_low!=null? d.cost_90_low+'~'+d.cost_90_high : '--')) +
+      cell('90%集中度', nz(d.concentration_90)) +
+      cell('70%成本区', (d.cost_70_low!=null? d.cost_70_low+'~'+d.cost_70_high : '--')) +
+      cell('70%集中度', nz(d.concentration_70)) +
+      cell('数据日期', nz(d.date));
+    drawCyq(d.series || []);
+  }
+
+  function drawCyq(series) {
+    const cv = document.getElementById('cyqCanvas');
+    const dpr = Math.min(window.devicePixelRatio||1, 2);
+    const cssW = cv.clientWidth || 800, cssH = 300;
+    cv.width = cssW * dpr; cv.height = cssH * dpr;
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,cssW,cssH);
+    if (!series.length) return;
+    const padL = 56, padR = 16, padT = 14, padB = 28;
+    const w = cssW - padL - padR, h = cssH - padT - padB;
+    const lows = series.map(s=>s.low_90).filter(v=>v!=null);
+    const highs = series.map(s=>s.high_90).filter(v=>v!=null);
+    if (!lows.length) return;
+    let max = Math.max(...highs), min = Math.min(...lows);
+    const range = (max-min)||1; max += range*0.08; min -= range*0.08;
+    const yOf = v => padT + h - (v-min)/(max-min)*h;
+    const n = series.length, cw = w / n;
+    const xOf = i => padL + cw*(i+0.5);
+    // 网格 + Y轴
+    ctx.strokeStyle = 'rgba(90,130,200,0.12)'; ctx.fillStyle = '#6b7a95'; ctx.font = '11px sans-serif';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (let i=0;i<=4;i++){
+      const v = min + (max-min)*i/4, y = yOf(v);
+      ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(padL+w,y); ctx.stroke();
+      ctx.fillText(v.toFixed(2), padL-6, y);
+    }
+    // X轴日期(首/中/尾)
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    [0, Math.floor(n/2), n-1].forEach(i => {
+      if (series[i] && series[i].date) ctx.fillText(series[i].date, xOf(i), padT+h+6);
+    });
+    // 90%成本区间带状（面积填充 high_90..low_90）
+    ctx.beginPath();
+    for (let i=0;i<n;i++){ const s=series[i]; if(s.high_90==null)continue; const x=xOf(i),y=yOf(s.high_90); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+    for (let i=n-1;i>=0;i--){ const s=series[i]; if(s.low_90==null)continue; ctx.lineTo(xOf(i),yOf(s.low_90)); }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(212,175,90,0.15)'; ctx.fill();
+    // 平均成本线
+    ctx.strokeStyle = '#d4af5a'; ctx.lineWidth = 1.8; ctx.beginPath();
+    let started=false;
+    for (let i=0;i<n;i++){ const s=series[i]; if(s.avg_cost==null)continue; const x=xOf(i),y=yOf(s.avg_cost); started?ctx.lineTo(x,y):(ctx.moveTo(x,y),started=true); }
+    ctx.stroke();
+    // 图例
+    ctx.fillStyle = '#d4af5a'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('— 平均成本', padL+4, padT+2);
+    ctx.fillStyle = 'rgba(212,175,90,0.5)';
+    ctx.fillText('▭ 90%成本区间', padL+84, padT+2);
   }
 
   async function loadAnalyze() {

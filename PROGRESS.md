@@ -83,7 +83,11 @@
   - _api_cyq: subprocess 调 .cyqenv/bin/python cyq_report.py，强制 no_proxy=* 直连，取最后一行JSON避免warning污染
   - cyq_report.py 内部5次退避重试(东财偶发连接重置) + 60s缓存，命中后秒回
   - 验收: 连续多次 API 返回真实筹码(获利5.78% series30) ✅
-- [ ] **C3** K线弹窗加第三Tab「筹码」: 成本区间带状图 + 获利盘/集中度指标
+- [x] **C3** K线弹窗加第三Tab「🎰筹码」: 成本区间带状图 + 获利盘/集中度指标
+  - 指标卡: 获利盘/平均成本/90-70成本区/集中度/数据日期；canvas 画90%成本区间带状图 + 平均成本线
+  - 验收: playwright 实测茅台真实筹码(获刉14.04%/均本1408/90成本区1195-1506)渲染, 零控制台错误 ✅
+
+> ✅ 里程碑 C 全部完成（C1隔离环境 / C2转发缓存 / C3前端Tab）
 
 ## 数据格式备忘
 quotes item: `{symbol,name,market,price,change_pct,change_amt,open,high,low,prev_close,volume,ts,stale?}`
