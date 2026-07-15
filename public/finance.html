@@ -19,6 +19,19 @@
     --up: #ff4d5e;
     --down: #22d380;
   }
+  html[data-theme="light"] {
+    --bg: #eef2f8;
+    --bg2: #f7f9fc;
+    --panel: rgba(255, 255, 255, 0.82);
+    --border: rgba(90, 130, 200, 0.28);
+    --gold: #b8862f;
+    --gold-dim: #96702a;
+    --cyan: #1a94c4;
+    --text: #1a2440;
+    --text-dim: #6b7a95;
+    --up: #e03444;
+    --down: #12a566;
+  }
   html, body {
     height: 100%;
     background: var(--bg);
@@ -100,6 +113,11 @@
     white-space: nowrap; transition: filter .15s; }
   .add-btn:hover { filter: brightness(1.25); }
   .add-btn:disabled { opacity: .5; cursor: default; }
+  .icon-btn { background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+    color: var(--text-dim); font-size: 15px; width: 34px; height: 32px; border-radius: 7px;
+    cursor: pointer; line-height: 1; transition: filter .15s, border-color .15s; }
+  .icon-btn:hover { border-color: var(--cyan); filter: brightness(1.2); }
+  .icon-btn.on { background: rgba(79,214,255,0.15); border-color: rgba(79,214,255,0.4); }
   .toast { position: fixed; top: 78px; right: 24px; z-index: 200;
     background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
     padding: 12px 18px; font-size: 13px; color: var(--text); box-shadow: 0 10px 30px rgba(0,0,0,0.5);
@@ -114,6 +132,8 @@
     justify-content: center; padding: 0; }
   .qcard:hover .qdel { display: flex; }
   .qcard .qdel:hover { background: var(--up); color: #fff; }
+  .qcard.dragging { opacity: .4; }
+  .qcard.drag-over { border-color: var(--cyan); box-shadow: 0 0 12px rgba(79,214,255,0.3); }
   /* 顶部栏占位 */
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -422,6 +442,8 @@
           <input id="addInput" class="add-input" placeholder="加自选 如 600519.SS" spellcheck="false" autocomplete="off">
           <button id="addBtn" class="add-btn">+ 加入</button>
         </div>
+        <button id="soundBtn" class="icon-btn" title="异动声音提醒">🔕</button>
+        <button id="themeBtn" class="icon-btn" title="深/浅色切换">☀️</button>
         <div class="stat fresh-dot off" id="freshBox" title="数据新鲜度">
           <span class="k">数据状态</span>
           <span class="fresh-dot off"><span class="dot"></span><span class="label" id="freshLabel">连接中…</span></span>
@@ -589,7 +611,7 @@
         const arrow = pct > 0 ? '▲' : (pct < 0 ? '▼' : '—');
         const sign = pct > 0 ? '+' : '';
         const stale = (now - (it.ts||0)) > 120 ? ' stale' : '';
-        html += '<div class="qcard ' + cls + stale + '" data-symbol="' + it.symbol + '">' +
+        html += '<div class="qcard ' + cls + stale + '" draggable="true" data-symbol="' + it.symbol + '">' +
           '<span class="qbar"></span>' +
           '<button class="qdel" data-del="' + it.symbol + '" title="移除自选">×</button>' +
           '<div class="qname">' + (it.name||it.symbol) + '</div>' +
@@ -744,6 +766,46 @@
   }
   addBtn.addEventListener('click', addWatch);
   addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addWatch(); });
+
+  // 异动声音提醒
+  let soundOn = localStorage.getItem('fs_sound') === '1';
+  const soundBtn = document.getElementById('soundBtn');
+  function syncSoundBtn() { soundBtn.textContent = soundOn ? '🔔' : '🔕'; soundBtn.classList.toggle('on', soundOn); }
+  syncSoundBtn();
+  let audioCtx = null;
+  function playBeep(direction) {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = 'sine';
+      o.frequency.value = direction === 'up' ? 880 : 520;
+      g.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.35);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + 0.36);
+    } catch (e) {}
+  }
+  soundBtn.addEventListener('click', () => {
+    soundOn = !soundOn;
+    localStorage.setItem('fs_sound', soundOn ? '1' : '0');
+    syncSoundBtn();
+    if (soundOn) { playBeep('up'); showToast('异动声音提醒已开', 'ok'); }
+    else showToast('已静音', '');
+  });
+
+  // 深/浅色主题切换
+  const themeBtn = document.getElementById('themeBtn');
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    themeBtn.textContent = t === 'light' ? '🌙' : '☀️';
+  }
+  applyTheme(localStorage.getItem('fs_theme') || 'dark');
+  themeBtn.addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    localStorage.setItem('fs_theme', cur);
+    applyTheme(cur);
+  });
 
   // S5: cobe 3D 地球 + 市场光点
   // 各市场地理坐标 [纬度, 经度]
@@ -1179,6 +1241,46 @@
   moversWrap.addEventListener('click', (e) => {
     const row = e.target.closest('.mv-row'); if (row) openKline(row.dataset.symbol);
   });
+
+  // 自选拖拽排序
+  let dragSym = null;
+  quotesWrap.addEventListener('dragstart', (e) => {
+    const card = e.target.closest('.qcard'); if (!card) return;
+    dragSym = card.dataset.symbol; card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  quotesWrap.addEventListener('dragend', (e) => {
+    const card = e.target.closest('.qcard'); if (card) card.classList.remove('dragging');
+    quotesWrap.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
+  });
+  quotesWrap.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    const card = e.target.closest('.qcard');
+    quotesWrap.querySelectorAll('.drag-over').forEach(c => { if (c !== card) c.classList.remove('drag-over'); });
+    if (card && card.dataset.symbol !== dragSym) card.classList.add('drag-over');
+  });
+  quotesWrap.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const target = e.target.closest('.qcard');
+    quotesWrap.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
+    if (!target || !dragSym || target.dataset.symbol === dragSym) return;
+    // 只允许同分类(市场)内排序，跨组不处理
+    const order = lastItems.map(i => i.symbol);
+    const from = order.indexOf(dragSym), to = order.indexOf(target.dataset.symbol);
+    if (from < 0 || to < 0) return;
+    order.splice(to, 0, order.splice(from, 1)[0]);
+    // 乐观重排 lastItems 并重渲染
+    lastItems.sort((a,b) => order.indexOf(a.symbol) - order.indexOf(b.symbol));
+    renderQuotes(lastItems);
+    try {
+      await fetch('/api/finance/watchlist/reorder', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ order })
+      });
+      showToast('自选顺序已保存', 'ok');
+    } catch (err) { showToast('排序保存失败', 'err'); }
+    dragSym = null;
+  });
   document.getElementById('kClose').addEventListener('click', closeKline);
   modal.addEventListener('click', (e) => { if (e.target === modal) closeKline(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeKline(); });
@@ -1223,9 +1325,11 @@
       const items = d.items || [];
       // 有新报警时闪一下
       if (items.length && items[0].id > lastAlertId) {
+        const isFirst = lastAlertId === 0;
         lastAlertId = items[0].id;
         alertBar.style.transition = 'none';
         alertBar.classList.add('active');
+        if (!isFirst && soundOn) playBeep(items[0].direction);
       }
       renderAlerts(items);
     } catch (e) { /* 静默 */ }

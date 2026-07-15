@@ -1119,6 +1119,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_watchlist_add(data)
             if path == '/api/finance/watchlist/remove':
                 return self._api_watchlist_remove(data)
+            if path == '/api/finance/watchlist/reorder':
+                return self._api_watchlist_reorder(data)
         except Exception as e:
             return self._json(500, {'ok': False, 'error': str(e)})
         return self._json(404, {'ok': False, 'error': 'not found'})
@@ -1153,6 +1155,16 @@ class Handler(SimpleHTTPRequestHandler):
         with _db_lock, db() as c:
             c.execute('DELETE FROM watchlist WHERE symbol=?', (symbol,))
         return self._json(200, {'ok': True, 'symbol': symbol})
+
+    def _api_watchlist_reorder(self, data):
+        """按前端传来的 symbols 顺序重排 sort_order"""
+        order = data.get('order') or []
+        if not isinstance(order, list) or not order:
+            return self._json(400, {'ok': False, 'error': 'order required'})
+        with _db_lock, db() as c:
+            for i, sym in enumerate(order):
+                c.execute('UPDATE watchlist SET sort_order=? WHERE symbol=?', (i, str(sym).strip().upper()))
+        return self._json(200, {'ok': True, 'count': len(order)})
 
     def _api_quotes(self, q):
         """立即返回DB数据（秒回），实时刷新由后台线程做"""
