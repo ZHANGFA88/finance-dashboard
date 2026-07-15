@@ -772,6 +772,7 @@ def fetch_sectors(kind='concept', limit=10):
 
 _idx_cache = {'data': None, 'ts': 0}
 _cyq_cache = {}  # symbol -> {data, ts}  C2 筹码缓存
+_sector_cache = {}  # kind -> {data, ts}  板块缓存
 def _index_cache_get(ttl=30):
     """大盘四大指数带缓存(默认30s)，避免 analyze 频繁拉新浪"""
     now = time.time()
@@ -781,6 +782,18 @@ def _index_cache_get(ttl=30):
     if idx:
         _idx_cache['data'] = idx; _idx_cache['ts'] = now
     return idx or (_idx_cache['data'] or [])
+
+def _sector_cache_get(kind='concept', ttl=60):
+    """板块热点带缓存(默认60s)，避免大屏轮询频繁打东财"""
+    now = time.time()
+    c = _sector_cache.get(kind)
+    if c and now - c['ts'] < ttl:
+        return c['data']
+    data = fetch_sectors(kind=kind, limit=12)
+    if data:
+        _sector_cache[kind] = {'data': data, 'ts': now}
+        return data
+    return (c['data'] if c else [])
 
 def classify_index_trend(idx):
     """大盘定性：由四大指数当日涨跌粗判"""
@@ -1082,6 +1095,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_analyze(q)
             if path == '/api/finance/cyq':
                 return self._api_cyq(q)
+            if path == '/api/finance/indices':
+                return self._api_indices(q)
+            if path == '/api/finance/sectors':
+                return self._api_sectors(q)
             if path == '/' :
                 self.path = '/public/finance.html'
         except Exception as e:
@@ -1133,6 +1150,20 @@ class Handler(SimpleHTTPRequestHandler):
         items = [dict(r) for r in rs]
         return self._json(200, {'ok': True, 'items': items, 'ts': int(time.time()),
                                 'trading': is_a_share_trading_time()})
+
+    def _api_indices(self, q):
+        """大盘四大指数实时（带缓存）"""
+        idx = _index_cache_get()
+        return self._json(200, {'ok': True, 'items': idx, 'trend': classify_index_trend(idx),
+                                'ts': int(time.time())})
+
+    def _api_sectors(self, q):
+        """板块热点涨幅榜。kind: concept(概念) / industry(行业)，带缓存"""
+        kind = (q.get('kind') or ['concept'])[0]
+        if kind not in ('concept', 'industry'):
+            kind = 'concept'
+        data = _sector_cache_get(kind=kind)
+        return self._json(200, {'ok': True, 'kind': kind, 'items': data, 'ts': int(time.time())})
 
     def _api_analyze(self, q):
         """B4: 聚合 B1指标 + B2大盘/板块 + B3多空判断，返回结构化技术面解读"""
