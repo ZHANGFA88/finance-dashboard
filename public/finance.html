@@ -88,6 +88,32 @@
   .index-bar .idx.up .idx-v { color: var(--up); }
   .index-bar .idx.down .idx-v { color: var(--down); }
   .index-bar .idx.flat .idx-v { color: var(--text-dim); }
+  /* 加自选搜索框 */
+  .add-watch { display: flex; align-items: center; gap: 6px; }
+  .add-input { background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+    color: var(--text); font-size: 12px; padding: 6px 10px; border-radius: 7px; width: 130px;
+    outline: none; transition: border-color .15s, width .2s; }
+  .add-input:focus { border-color: var(--cyan); width: 150px; }
+  .add-input::placeholder { color: var(--text-dim); }
+  .add-btn { background: rgba(79,214,255,0.12); border: 1px solid rgba(79,214,255,0.35);
+    color: var(--cyan); font-size: 12px; padding: 6px 12px; border-radius: 7px; cursor: pointer;
+    white-space: nowrap; transition: filter .15s; }
+  .add-btn:hover { filter: brightness(1.25); }
+  .add-btn:disabled { opacity: .5; cursor: default; }
+  .toast { position: fixed; top: 78px; right: 24px; z-index: 200;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 18px; font-size: 13px; color: var(--text); box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    opacity: 0; transform: translateY(-8px); transition: opacity .25s, transform .25s; pointer-events: none; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.ok { border-color: rgba(34,211,128,0.5); }
+  .toast.err { border-color: rgba(255,77,94,0.5); }
+  /* 自选卡片删除按钮 */
+  .qcard .qdel { position: absolute; top: 6px; right: 8px; width: 18px; height: 18px;
+    border-radius: 50%; border: none; background: rgba(255,255,255,0.08); color: var(--text-dim);
+    font-size: 13px; line-height: 1; cursor: pointer; display: none; align-items: center;
+    justify-content: center; padding: 0; }
+  .qcard:hover .qdel { display: flex; }
+  .qcard .qdel:hover { background: var(--up); color: #fff; }
   /* 顶部栏占位 */
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
@@ -383,6 +409,7 @@
 </style>
 </head>
 <body>
+  <div class="toast" id="toast"></div>
   <div class="layout">
     <!-- 顶部栏（S2 将填充时钟/新鲜度） -->
     <header class="topbar">
@@ -391,6 +418,10 @@
         <span class="sub">金融行情大屏</span>
       </div>
       <div class="status-group">
+        <div class="add-watch">
+          <input id="addInput" class="add-input" placeholder="加自选 如 600519.SS" spellcheck="false" autocomplete="off">
+          <button id="addBtn" class="add-btn">+ 加入</button>
+        </div>
         <div class="stat fresh-dot off" id="freshBox" title="数据新鲜度">
           <span class="k">数据状态</span>
           <span class="fresh-dot off"><span class="dot"></span><span class="label" id="freshLabel">连接中…</span></span>
@@ -560,6 +591,7 @@
         const stale = (now - (it.ts||0)) > 120 ? ' stale' : '';
         html += '<div class="qcard ' + cls + stale + '" data-symbol="' + it.symbol + '">' +
           '<span class="qbar"></span>' +
+          '<button class="qdel" data-del="' + it.symbol + '" title="移除自选">×</button>' +
           '<div class="qname">' + (it.name||it.symbol) + '</div>' +
           '<div class="qsym">' + it.symbol + '</div>' +
           '<div class="qprice">' + fmtPrice(it.price) + '</div>' +
@@ -663,6 +695,55 @@
   }));
   refreshSectors();
   setInterval(refreshSectors, 60000);
+
+  // 搜索加自选 / 删自选
+  const toastEl = document.getElementById('toast');
+  let toastTimer = null;
+  function showToast(msg, kind) {
+    toastEl.textContent = msg;
+    toastEl.className = 'toast show ' + (kind || '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastEl.className = 'toast ' + (kind || ''); }, 2600);
+  }
+  const addInput = document.getElementById('addInput');
+  const addBtn = document.getElementById('addBtn');
+  async function addWatch() {
+    const sym = (addInput.value || '').trim().toUpperCase();
+    if (!sym) { addInput.focus(); return; }
+    addBtn.disabled = true; addBtn.textContent = '添加中';
+    try {
+      const r = await fetch('/api/finance/watchlist/add', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ symbol: sym })
+      });
+      const d = await r.json();
+      if (d.ok) {
+        showToast('已加入自选：' + (d.name || sym), 'ok');
+        addInput.value = '';
+        refreshAll();
+      } else {
+        showToast(d.error || '添加失败', 'err');
+      }
+    } catch (e) {
+      showToast('网络错误，稍后重试', 'err');
+    } finally {
+      addBtn.disabled = false; addBtn.textContent = '+ 加入';
+    }
+  }
+  async function removeWatch(sym) {
+    if (!sym) return;
+    try {
+      const r = await fetch('/api/finance/watchlist/remove', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ symbol: sym })
+      });
+      const d = await r.json();
+      if (d.ok) { showToast('已移除：' + sym, 'ok'); refreshAll(); }
+      else showToast(d.error || '移除失败', 'err');
+    } catch (e) { showToast('网络错误', 'err'); }
+  }
+  addBtn.addEventListener('click', addWatch);
+  addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addWatch(); });
 
   // S5: cobe 3D 地球 + 市场光点
   // 各市场地理坐标 [纬度, 经度]
@@ -1091,6 +1172,8 @@
 
   // 事件绑定：卡片点击
   quotesWrap.addEventListener('click', (e) => {
+    const del = e.target.closest('.qdel');
+    if (del) { e.stopPropagation(); removeWatch(del.dataset.del); return; }
     const card = e.target.closest('.qcard'); if (card) openKline(card.dataset.symbol);
   });
   moversWrap.addEventListener('click', (e) => {

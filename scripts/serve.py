@@ -12,6 +12,7 @@ PUBLIC_DIR = os.path.join(BASE_DIR, 'public')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 DB_PATH = os.path.join(DATA_DIR, 'finance.db')
 PORT = int(os.environ.get('FINANCE_PORT', '8770'))
+HOST = os.environ.get('FINANCE_HOST', '127.0.0.1')  # 默认仅本机；局域网访问设 FINANCE_HOST=0.0.0.0
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -1105,6 +1106,54 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(500, {'ok': False, 'error': str(e)})
         return super().do_GET()
 
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length) if length else b''
+            data = json.loads(body.decode('utf-8')) if body else {}
+        except Exception:
+            data = {}
+        try:
+            if path == '/api/finance/watchlist/add':
+                return self._api_watchlist_add(data)
+            if path == '/api/finance/watchlist/remove':
+                return self._api_watchlist_remove(data)
+        except Exception as e:
+            return self._json(500, {'ok': False, 'error': str(e)})
+        return self._json(404, {'ok': False, 'error': 'not found'})
+
+    def _api_watchlist_add(self, data):
+        """添加自选股。symbol 必填，后端拉一次行情验证可用并拿名称"""
+        symbol = (data.get('symbol') or '').strip().upper()
+        if not symbol:
+            return self._json(400, {'ok': False, 'error': 'symbol required'})
+        with db() as c:
+            exist = c.execute('SELECT 1 FROM watchlist WHERE symbol=?', (symbol,)).fetchone()
+        if exist:
+            return self._json(200, {'ok': False, 'error': '已在自选中', 'symbol': symbol})
+        # 拉一次行情验证 symbol 有效
+        q = fetch_quotes([symbol], fallback_db=False)
+        if symbol not in q or q[symbol].get('price') is None:
+            return self._json(200, {'ok': False, 'error': '无法获取行情，请检查代码（如 600519.SS / 0700.HK / AAPL / BTC-USD）', 'symbol': symbol})
+        name = data.get('name') or q[symbol].get('name') or symbol
+        market = q[symbol].get('market') or _guess_market(symbol)
+        with _db_lock, db() as c:
+            mx = c.execute('SELECT COALESCE(MAX(sort_order),0) FROM watchlist').fetchone()[0]
+            c.execute('INSERT OR IGNORE INTO watchlist(symbol,name,market,sort_order,added_at) VALUES(?,?,?,?,?)',
+                      (symbol, name, market, mx + 1, int(time.time())))
+        save_quotes(q)
+        return self._json(200, {'ok': True, 'symbol': symbol, 'name': name, 'market': market})
+
+    def _api_watchlist_remove(self, data):
+        """删除自选股"""
+        symbol = (data.get('symbol') or '').strip().upper()
+        if not symbol:
+            return self._json(400, {'ok': False, 'error': 'symbol required'})
+        with _db_lock, db() as c:
+            c.execute('DELETE FROM watchlist WHERE symbol=?', (symbol,))
+        return self._json(200, {'ok': True, 'symbol': symbol})
+
     def _api_quotes(self, q):
         """立即返回DB数据（秒回），实时刷新由后台线程做"""
         with db() as c:
@@ -1281,8 +1330,8 @@ if __name__ == '__main__':
                 time.sleep(20)
         t = threading.Thread(target=bg_refresh, daemon=True)
         t.start()
-        srv = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-        print(f'FinSight serving at http://0.0.0.0:{PORT}')
+        srv = ThreadingHTTPServer((HOST, PORT), Handler)
+        print(f'FinSight serving at http://{HOST}:{PORT}')
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
