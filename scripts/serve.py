@@ -115,6 +115,7 @@ _HOST_INTERVALS = {
     'money.finance.sina.com.cn': 0.25,
     'vip.stock.finance.sina.com.cn': 0.25,
     'qt.gtimg.cn': 0.2,
+    'finance.pae.baidu.com': 0.25,
 }
 
 def _throttle_url(url):
@@ -367,6 +368,64 @@ def fetch_tencent(symbols):
         pass
     return out
 
+def fetch_cn_baidu(symbols):
+    """A股行情备源: 百度股市通(新浪/东财都挂时的第4层兜底)。逐只拉, 带限流。"""
+    import subprocess
+    out = {}
+    for sym in symbols:
+        code = sym.split('.')[0]
+        if not (sym.endswith('.SS') or sym.endswith('.SZ')):
+            continue
+        url = ('https://finance.pae.baidu.com/vapi/v1/getquotation?srcid=5353'
+               '&pointType=string&group=quotation_minute_ab&query=%s&code=%s'
+               '&market_type=ab&newFormat=1' % (code, code))
+        try:
+            _throttle_url(url)
+            raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                                  '-H', 'User-Agent: ' + UA,
+                                  '-H', 'Referer: https://gushitong.baidu.com/', url],
+                                 capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+            d = json.loads(raw)
+            r = d.get('Result') or {}
+            cur = r.get('cur') or {}
+            basic = r.get('basicinfos') or {}
+            price = cur.get('price')
+            if price in (None, '', '--'):
+                continue
+            price = float(price)
+            if price <= 0:
+                continue
+            # ratio 形如 "+0.00%"; increase 形如 "+0.03"
+            def _num(s):
+                try:
+                    return float(str(s).replace('%', '').replace('+', '').strip())
+                except (TypeError, ValueError):
+                    return 0
+            chg_amt = _num(cur.get('increase'))
+            pct = _num(cur.get('ratio'))
+            prev = round(price - chg_amt, 2) if chg_amt else price
+            # 从盘口拿开/高/低
+            pk = {x.get('ename'): x.get('value') for x in (r.get('pankouinfos') or {}).get('list', [])}
+            def _pk(k):
+                v = pk.get(k)
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return 0
+            out[sym] = {
+                'symbol': sym, 'name': basic.get('name') or sym, 'market': 'cn',
+                'price': round(price, 2),
+                'change_pct': round(pct, 2),
+                'change_amt': round(chg_amt, 2),
+                'open': _pk('open'), 'high': _pk('high'), 'low': _pk('low'),
+                'prev_close': prev,
+                'volume': _num(cur.get('volume')),
+                'ts': int(time.time()),
+            }
+        except Exception:
+            continue
+    return out
+
 def get_latest_from_db(symbols):
     """从DB读取最新快照（当实时抓取失败时兼底）"""
     out = {}
@@ -388,6 +447,9 @@ def fetch_quotes(symbols, fallback_db=True):
         missing = [s for s in cn if s not in r]
         if missing:
             r.update(fetch_cn_eastmoney(missing))
+        missing = [s for s in cn if s not in r]
+        if missing:
+            r.update(fetch_cn_baidu(missing))
         result.update(r)
     if other:
         r = fetch_yahoo(other)
