@@ -517,13 +517,47 @@ def fetch_kline_eastmoney(symbol, period='daily', count=250):
         pass
     return rows
 
+def fetch_kline_sina(symbol, period='daily', count=250):
+    """A股 K线备用源: 新浪(东财push2his被封时兜底)"""
+    # symbol: 600519.SS/000001.SZ -> sh600519/sz000001
+    code = symbol.split('.')[0]
+    prefix = 'sh' if symbol.endswith('.SS') else 'sz'
+    sina_sym = prefix + code
+    scale = {'daily': 240, 'weekly': 1680, 'monthly': 7200}.get(period, 240)
+    import subprocess
+    url = ('https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/'
+           'CN_MarketData.getKLineData?symbol=%s&scale=%d&ma=no&datalen=%d'
+           % (sina_sym, scale, count))
+    rows = []
+    try:
+        raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                              '-H', 'Referer: https://finance.sina.com.cn',
+                              '-H', 'User-Agent: ' + UA, url],
+                             capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+        arr = json.loads(raw)
+        for r in arr:
+            date = (r.get('day') or '')[:10]
+            if not date:
+                continue
+            o = float(r.get('open')); cl = float(r.get('close'))
+            h = float(r.get('high')); l = float(r.get('low')); v = float(r.get('volume'))
+            rows.append((symbol, period, date, o, h, l, cl, v))
+    except Exception:
+        pass
+    return rows
+
 def fetch_kline(symbol, period='daily', count=250):
-    """拉历史K线。A股走东财（不限流），其余Yahoo。period: daily/weekly/monthly"""
-    # A股优先东财
+    """拉历史K线。A股多源降级: 东财 → 新浪; 其余Yahoo。period: daily/weekly/monthly"""
+    # A股多源降级
     if symbol.endswith('.SS') or symbol.endswith('.SZ'):
         rows = fetch_kline_eastmoney(symbol, period, count)
         if rows:
             return rows
+        rows = fetch_kline_sina(symbol, period, count)
+        if rows:
+            print('[kline] %s 东财失败, 已降级新浪 (%d条)' % (symbol, len(rows)))
+            return rows
+        return []
     rng = {'daily': '1y', 'weekly': '2y', 'monthly': '5y'}.get(period, '1y')
     iv = {'daily': '1d', 'weekly': '1wk', 'monthly': '1mo'}.get(period, '1d')
     rows = []
@@ -921,43 +955,92 @@ def fetch_sectors(kind='concept', limit=10):
         time.sleep(1.2 * (attempt + 1))  # 退避重试
     return out
 
-def fetch_top_movers_cn(limit=40):
-    """全市场A股涨幅榜(锉选股候选池)。返回 [{code,name,change_pct,price,turnover_rate,main_inflow}]
-    东财 fs: 沪深A股(排除ST/科创/创业可选)，按涨幅降序"""
+def _movers_eastmoney(limit):
+    """主源: 东财 clist 全市场A股涨幅榜"""
     import subprocess
     # m:0 t:6=深主板 m:0 t:80=创业 m:1 t:2=沪主板 m:1 t:23=科创
     fs = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23'
     url = ('https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3'
            '&fs=%s&fields=f12,f14,f2,f3,f8,f62' % (limit, fs))
-    for attempt in range(3):
+    raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                          '-H', 'Referer: https://quote.eastmoney.com/',
+                          '-H', 'User-Agent: ' + UA, url],
+                         capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+    d = json.loads(raw)
+    diff = (d.get('data') or {}).get('diff') or {}
+    rows = diff.values() if isinstance(diff, dict) else diff
+    out = []
+    for r in rows:
+        code = r.get('f12'); name = r.get('f14')
+        if not code or not name:
+            continue
+        pct = r.get('f3')
+        sym = code + ('.SS' if code.startswith('6') else '.SZ')
+        out.append({
+            'code': code, 'symbol': sym, 'name': name,
+            'change_pct': round(float(pct) / 100.0, 2) if pct not in (None, '-') else 0,
+            'price': round(float(r.get('f2')) / 100.0, 2) if r.get('f2') not in (None, '-') else None,
+            'turnover_rate': round(float(r.get('f8')) / 100.0, 2) if r.get('f8') not in (None, '-') else None,
+            'main_inflow': r.get('f62'),
+        })
+    return out
+
+def _movers_sina(limit):
+    """备源1: 新浪 Market_Center 全市场A股涨幅榜(东财push2被封时兜底)"""
+    import subprocess
+    url = ('https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/'
+           'Market_Center.getHQNodeData?page=1&num=%d&sort=changepercent&asc=0&node=hs_a' % limit)
+    raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                          '-H', 'Referer: https://finance.sina.com.cn',
+                          '-H', 'User-Agent: ' + UA, url],
+                         capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+    rows = json.loads(raw)
+    out = []
+    for r in rows:
+        code = r.get('code'); name = r.get('name')
+        if not code or not name:
+            continue
+        # 新浪 symbol 形如 sh600519/sz000001/bj920305; 过滤北交所(bj)避免无K线
+        ssym = (r.get('symbol') or '').lower()
+        if ssym.startswith('bj'):
+            continue
+        sym = code + ('.SS' if code.startswith('6') else '.SZ')
         try:
-            raw = subprocess.run(['curl', '-s', '--max-time', '10',
-                                  '-H', 'Referer: https://quote.eastmoney.com/',
-                                  '-H', 'User-Agent: ' + UA, url],
-                                 capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
-            d = json.loads(raw)
-            diff = (d.get('data') or {}).get('diff') or {}
-            rows = diff.values() if isinstance(diff, dict) else diff
-            out = []
-            for r in rows:
-                code = r.get('f12'); name = r.get('f14')
-                if not code or not name:
-                    continue
-                pct = r.get('f3')
-                # 代码 -> 带后缀: 6开头沪市.SS, 其余.SZ
-                sym = code + ('.SS' if code.startswith('6') else '.SZ')
-                out.append({
-                    'code': code, 'symbol': sym, 'name': name,
-                    'change_pct': round(float(pct) / 100.0, 2) if pct not in (None, '-') else 0,
-                    'price': round(float(r.get('f2')) / 100.0, 2) if r.get('f2') not in (None, '-') else None,
-                    'turnover_rate': round(float(r.get('f8')) / 100.0, 2) if r.get('f8') not in (None, '-') else None,
-                    'main_inflow': r.get('f62'),
-                })
-            if out:
-                return out
-        except Exception:
-            pass
-        time.sleep(1.2 * (attempt + 1))
+            pct = float(r.get('changepercent'))
+        except (TypeError, ValueError):
+            pct = 0
+        try:
+            price = float(r.get('trade'))
+        except (TypeError, ValueError):
+            price = None
+        try:
+            tr = float(r.get('turnoverratio'))
+        except (TypeError, ValueError):
+            tr = None
+        out.append({
+            'code': code, 'symbol': sym, 'name': name,
+            'change_pct': round(pct, 2),
+            'price': round(price, 2) if price is not None else None,
+            'turnover_rate': round(tr, 2) if tr is not None else None,
+            'main_inflow': None,
+        })
+    return out
+
+def fetch_top_movers_cn(limit=40):
+    """全市场A股涨幅榜(选股候选池)。多源自动降级: 东财 → 新浪。
+    返回 [{code,symbol,name,change_pct,price,turnover_rate,main_inflow}]"""
+    sources = [('eastmoney', _movers_eastmoney), ('sina', _movers_sina)]
+    for name, fn in sources:
+        for attempt in range(2):
+            try:
+                out = fn(limit)
+                if out:
+                    if name != 'eastmoney':
+                        print('[movers] 主源东财失败, 已降级至 %s (%d条)' % (name, len(out)))
+                    return out
+            except Exception as e:
+                print('[movers] 源 %s 第%d次异常: %s' % (name, attempt + 1, e))
+            time.sleep(1.0 * (attempt + 1))
     return []
 
 def score_pick(symbol, name, hot_pct=None):
