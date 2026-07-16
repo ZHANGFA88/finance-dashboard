@@ -575,6 +575,30 @@ def fetch_quotes(symbols, fallback_db=True):
                 result[s] = q
     return result
 
+def _normalize_symbol(raw):
+    """智能规范化用户输入的代码, 自动补后缀。
+    纯数字: 6/9开头→沪市.SS, 0/2/3开头→深市.SZ, 4/8开头→深(北交所暂归.SZ探测)
+    已带后缀/美股/加密等保持原样。"""
+    s = (raw or '').strip().upper()
+    if not s:
+        return s
+    # 已带后缀或特殊后缀, 不动
+    if any(s.endswith(x) for x in ('.SS', '.SZ', '.HK', '=X', '-USD')):
+        return s
+    # 纯数字 A股代码: 按首位判断沪深
+    if s.isdigit():
+        if len(s) == 6:
+            # 6/9→沪; 0/2/3→深; 其余默认沪
+            if s[0] in ('6', '9'):
+                return s + '.SS'
+            if s[0] in ('0', '2', '3'):
+                return s + '.SZ'
+            return s + '.SS'
+        # 4位/5位数字很可能是港股
+        if len(s) in (4, 5):
+            return s.zfill(4) + '.HK'
+    return s
+
 def _guess_market(sym):
     if sym.endswith('.SS') or sym.endswith('.SZ'):
         return 'cn'
@@ -1713,8 +1737,8 @@ class Handler(SimpleHTTPRequestHandler):
         return self._json(404, {'ok': False, 'error': 'not found'})
 
     def _api_watchlist_add(self, data):
-        """添加自选股。symbol 必填，后端拉一次行情验证可用并拿名称"""
-        symbol = (data.get('symbol') or '').strip().upper()
+        """添加自选股。symbol 必填，自动补后缀后拉一次行情验证可用并拿名称"""
+        symbol = _normalize_symbol(data.get('symbol') or '')
         if not symbol:
             return self._json(400, {'ok': False, 'error': 'symbol required'})
         with db() as c:
