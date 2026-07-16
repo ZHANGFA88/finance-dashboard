@@ -93,3 +93,52 @@
 quotes item: `{symbol,name,market,price,change_pct,change_amt,open,high,low,prev_close,volume,ts,stale?}`
 market枚举: cn=A股 hk=港股 us=美股 etf=ETF crypto=加密 fx=外汇
 服务: `python3 scripts/serve.py`（端口8770），根路径 `/` → public/finance.html
+
+## Day 4 ✅ 多源降级 + 主动限流架构（2026-07-16）
+
+> 背景：东财 push2 接口被 Surge 误代理到黑洞IP + 高频请求触发反爬软封，导致选股/行情全空。
+> 解决思路：吸收 HKUDS/Vibe-Trading 的多源降级 + HostThrottle 主动限流设计。
+
+### 根因排查（重要教训）
+- **Surge 路由劫持**：`eastmoney.com`（.com结尾）不匹配国内直连规则集，掉到 `FINAL→代理`，被当境外站导进黑洞IP `198.18.x.x`（fake-ip网段）。
+- **激活配置定位**：Surge 有多个 profile，用 `lsof -p <surge_pid> | grep .conf` 才能确认真正激活的是哪个（本机是 `新甲骨文.conf`，不是文件名最新的那个）。
+- **反爬软封**：短时间高频打 push2 会触发东财 IP 级软封（官网正常、仅API子域返回空body），几小时自动解封。
+- 修复：在激活 profile 的 `[Rule]` 顶部加 `DOMAIN-SUFFIX,eastmoney.com,🏠「国内直连」`（同理加 sinajs/qq/gtimg/tushare/xueqiu/baidu），`surge-cli reload` 生效。
+
+### A股行情 5 源降级链（fetch_quotes）
+```
+新浪 hq.sinajs → 东财 push2 → 雪球 batch/quote → 百度股市通 → DB旧值
+```
+- **新浪** `fetch_cn_sina`：批量 `hq.sinajs.cn/list=`，GBK编码，主源最快。
+- **东财** `fetch_cn_eastmoney`：push2 stock/get，逐只，~3秒延迟。
+- **雪球** `fetch_cn_xueqiu`：⚠️两步式token — 先访 `xueqiu.com` 拿 acw_tc → 再访 `/hq` 下发 `xq_a_token`；必须用 Python `cookiejar`（curl存不住httponly）；用 `batch/quote.json`（旧`quotec.json`已废返回空）；token缓存1500s，失败强制刷新。字段最全、支持批量。
+- **百度** `fetch_cn_baidu`：`finance.pae.baidu.com/vapi/v1/getquotation`，免鉴权，逐只，取 `Result.cur`（price/ratio/increase）+ `pankouinfos`（开高低）。
+- **DB兜底**：`get_latest_from_db` 读 quote_latest 旧快照。
+
+### 选股候选池 2 源降级（fetch_top_movers_cn）
+```
+东财 clist → 新浪 Market_Center → 自选股兜底(watchlist)
+```
+- 新浪备源 `_movers_sina`：`vip.stock.finance.sina.com.cn/.../Market_Center.getHQNodeData`，过滤北交所(bj)。
+- ⚠️盘前(9:30前)涨幅榜全是0.000且默认返回bj股，属正常，会降级到自选股兜底。
+
+### A股K线 2 源降级（fetch_kline）
+```
+东财 push2his → 新浪 CN_MarketData.getKLineData
+```
+
+### 主动限流器 _HostThrottle（吸收 Vibe-Trading）
+- 按 host 分桶强制最小请求间隔 + 随机抖动（进程内共享），从源头防封IP。
+- 间隔配置 `_HOST_INTERVALS`：东财0.6s（封IP最凶）/ 新浪·百度0.2-0.25s / 腾讯0.2s。
+- 接入点：`http_get`/`http_get_curl` + 所有直接 subprocess curl（用 `_throttle_url(url)`）；雪球用 `_THROTTLE.wait('xueqiu.com',0.3)` 直调。
+- 实测：东财间隔精准0.67s→1.43s，腾讯0.30s→0.80s。
+
+### 开源合集核查结论（24项）
+- 真实可访问11项，死链9项。**筹码核心 #10/#14（openclaw/skills 仓库根本404）、Tushare #11 全是死链**——筹码继续用自研 `.cyqenv` + akshare cyq。
+- 有参考价值：#20 Vibe-Trading（多源降级架构，已吸收）、#7 独立venv绘图（与.cyqenv吻合）。
+- `tecent-finance` 技能包残缺（只有文档无脚本），功能是本大屏子集，无需安装。
+
+### git 提交
+- `8bfcb79` 主动限流 HostThrottle
+- `7acdbec` 第4源百度
+- `62aa23e` 第5源雪球（两步式token）
