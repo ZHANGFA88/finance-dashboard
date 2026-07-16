@@ -4,7 +4,7 @@
 FinSight 金融大屏后端 - 纯标准库 + SQLite
 多源: A股走东方财富(~3秒), 港美股/ETF/外汇/加密走 Yahoo Finance
 """
-import os, json, time, sqlite3, urllib.parse, urllib.request, re, threading
+import os, json, time, sqlite3, urllib.parse, urllib.request, re, threading, random
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -81,7 +81,54 @@ def init_db():
                 c.execute("INSERT OR IGNORE INTO watchlist(symbol,name,market,sort_order,added_at) VALUES(?,?,?,?,?)",
                           (s,nm,mk,i,int(time.time())))
 
+# ========== 主动限流器(吸收 Vibe-Trading HostThrottle: 从源头防封IP) ==========
+class _HostThrottle:
+    """按host分桶强制最小请求间隔+随机抖动, 进程内共享。
+    东财等公共免费源按IP封禁, 突发请求会被软封; 主动限速从根上避免触发。"""
+    _JITTER = 0.3
+    def __init__(self):
+        self._last = {}
+        self._lock = threading.Lock()
+    def wait(self, bucket, min_interval):
+        if min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            last = self._last.get(bucket)
+            if last is None or now >= last + min_interval:
+                fire_at = now
+            else:
+                fire_at = last + min_interval + random.uniform(0.0, self._JITTER)
+            self._last[bucket] = fire_at
+        sleep_for = fire_at - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+_THROTTLE = _HostThrottle()
+
+# 各host的最小请求间隔(秒): 东财封IP最凶, 间隔最大; 新浪/腾讯宽松
+_HOST_INTERVALS = {
+    'push2.eastmoney.com': 0.6,
+    'push2his.eastmoney.com': 0.6,
+    'quote.eastmoney.com': 0.6,
+    'hq.sinajs.cn': 0.2,
+    'money.finance.sina.com.cn': 0.25,
+    'vip.stock.finance.sina.com.cn': 0.25,
+    'qt.gtimg.cn': 0.2,
+}
+
+def _throttle_url(url):
+    """根据URL的host自动限速。未登记的host不限速。"""
+    try:
+        host = urllib.parse.urlparse(url).hostname or ''
+    except Exception:
+        return
+    iv = _HOST_INTERVALS.get(host)
+    if iv:
+        _THROTTLE.wait(host, iv)
+
 def http_get(url, headers=None, timeout=10):
+    _throttle_url(url)
     req = urllib.request.Request(url, headers=headers or {'User-Agent': UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode('utf-8', 'ignore')
@@ -89,6 +136,7 @@ def http_get(url, headers=None, timeout=10):
 def http_get_curl(url, headers=None, timeout=12):
     """curl 兑底：urllib 被 Yahoo 429 限流时，curl 的 TLS 指纹往往能正常返回"""
     import subprocess
+    _throttle_url(url)
     cmd = ['curl', '-s', '--max-time', str(int(timeout)),
            '-H', 'User-Agent: ' + (headers or {}).get('User-Agent', UA),
            '-H', 'Accept: application/json,text/plain,*/*',
@@ -281,6 +329,7 @@ def fetch_tencent(symbols):
     try:
         import subprocess
         url = 'https://qt.gtimg.cn/q=' + ','.join(code_map.keys())
+        _throttle_url(url)
         raw = subprocess.run(['curl', '-s', '--max-time', '10', url],
                              capture_output=True, timeout=13).stdout.decode('gbk', 'ignore')
         for line in raw.strip().split(';'):
@@ -530,6 +579,7 @@ def fetch_kline_sina(symbol, period='daily', count=250):
            % (sina_sym, scale, count))
     rows = []
     try:
+        _throttle_url(url)
         raw = subprocess.run(['curl', '-s', '--max-time', '10',
                               '-H', 'Referer: https://finance.sina.com.cn',
                               '-H', 'User-Agent: ' + UA, url],
@@ -823,6 +873,7 @@ def fetch_indices():
     try:
         import subprocess
         url = 'https://hq.sinajs.cn/list=' + codes
+        _throttle_url(url)
         raw = subprocess.run(['curl', '-s', '--max-time', '8',
                               '-H', 'Referer: https://finance.sina.com.cn',
                               '-H', 'User-Agent: ' + UA, url],
@@ -868,6 +919,7 @@ def fetch_global_indices():
     out = []
     try:
         url = 'https://hq.sinajs.cn/list=' + codes
+        _throttle_url(url)
         raw = subprocess.run(['curl', '-s', '--max-time', '10',
                               '-H', 'Referer: https://finance.sina.com.cn',
                               '-H', 'User-Agent: ' + UA, url],
@@ -935,6 +987,7 @@ def fetch_sectors(kind='concept', limit=10):
         out = []
         try:
             import subprocess
+            _throttle_url(url)
             raw = subprocess.run(['curl', '-s', '--max-time', '10', url],
                                  capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
             d = json.loads(raw)
@@ -962,6 +1015,7 @@ def _movers_eastmoney(limit):
     fs = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23'
     url = ('https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3'
            '&fs=%s&fields=f12,f14,f2,f3,f8,f62' % (limit, fs))
+    _throttle_url(url)
     raw = subprocess.run(['curl', '-s', '--max-time', '10',
                           '-H', 'Referer: https://quote.eastmoney.com/',
                           '-H', 'User-Agent: ' + UA, url],
@@ -990,6 +1044,7 @@ def _movers_sina(limit):
     import subprocess
     url = ('https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/'
            'Market_Center.getHQNodeData?page=1&num=%d&sort=changepercent&asc=0&node=hs_a' % limit)
+    _throttle_url(url)
     raw = subprocess.run(['curl', '-s', '--max-time', '10',
                           '-H', 'Referer: https://finance.sina.com.cn',
                           '-H', 'User-Agent: ' + UA, url],
