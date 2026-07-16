@@ -269,16 +269,20 @@ def fetch_cn_eastmoney(symbols):
         time.sleep(0.2)
     return out
 
+_yahoo_breaker = {'until': 0}  # Yahoo 429熔断: until前直接跳过不死等
 def fetch_yahoo(symbols):
-    """港股/美股/ETF/外汇/加密走 Yahoo（带间隔+重试防限流）"""
+    """港股/美股/ETF/外汇/加密走 Yahoo（带熔断+重试防限流）"""
     out = {}
+    # 熔断期内直接跳过Yahoo(避免429时死等拖垮后台刷新)
+    if time.time() < _yahoo_breaker['until']:
+        return out
     for i, sym in enumerate(symbols):
         got = False
-        for attempt in range(2):
+        for attempt in range(1):
             try:
-                host = 'query1' if attempt == 0 else 'query2'
+                host = 'query1'
                 url = f'https://{host}.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?interval=1d&range=1d'
-                d = json.loads(http_get_retry(url, timeout=12))
+                d = json.loads(http_get_retry(url, timeout=5))
                 res = d.get('chart', {}).get('result')
                 if not res:
                     raise ValueError('no result')
@@ -303,9 +307,12 @@ def fetch_yahoo(symbols):
                 got = True
                 break
             except Exception:
-                time.sleep(0.8)
+                # Yahoo任何失败(429/超时/curl rc28)都触发熔断: 冷却60s内直接跳过,
+                # 不死等拖垮后台刷新。加密/外汇走DB兜底，影响小。
+                _yahoo_breaker['until'] = time.time() + 60
+                return out
         # 防限流：请求间隔
-        time.sleep(0.4)
+        time.sleep(0.15)
     return out
 
 def _tencent_code(sym):
@@ -547,11 +554,16 @@ def fetch_quotes(symbols, fallback_db=True):
             r.update(fetch_cn_baidu(missing))
         result.update(r)
     if other:
-        r = fetch_yahoo(other)
-        # A3: Yahoo 失败的用腾讯顶上（美股/港股）
+        # 港股/美股: 腾讯优先(国内快且稳, 0.2s), Yahoo只留给腾讯不支持的加密/外汇
+        tencent_ok = [s for s in other if _tencent_code(s)]  # 港美股
+        yahoo_only = [s for s in other if not _tencent_code(s)]  # 加密-USD/外汇=X
+        r = {}
+        if tencent_ok:
+            r.update(fetch_tencent(tencent_ok))
+        # 腾讯没拿到的 + 加密外汇 → Yahoo兼底
         missing = [s for s in other if s not in r]
         if missing:
-            r.update(fetch_tencent(missing))
+            r.update(fetch_yahoo(missing))
         result.update(r)
     # DB旧值兼底
     if fallback_db:
@@ -1864,7 +1876,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(400, {'ok': False, 'error': 'symbol required'})
         now = time.time()
         cached = _cyq_cache.get(symbol)
-        if cached and now - cached['ts'] < 60:
+        # 筹码数据一天只变一次(收盘后), 同一天缓存到次日凌晨; 持续命中秒回
+        if cached and time.strftime('%Y-%m-%d', time.localtime(cached['ts'])) == time.strftime('%Y-%m-%d', time.localtime(now)):
             return self._json(200, cached['data'])
         py = os.path.join(BASE_DIR, '.cyqenv', 'bin', 'python')
         script = os.path.join(BASE_DIR, 'scripts', 'cyq_report.py')
@@ -1941,6 +1954,7 @@ if __name__ == '__main__':
         # 全球大盘指数预热线程（独立节奏，错开自选刷新防限流，让前端首次秒开）
         def bg_global():
             time.sleep(5)  # 先让自选首轮跑完，错开
+            kline_warm_ts = 0
             while True:
                 try:
                     _global_index_cache_get(ttl=55)
@@ -1950,6 +1964,22 @@ if __name__ == '__main__':
                 try:
                     _sector_cache_get('concept', ttl=55)
                     _sector_cache_get('industry', ttl=55)
+                except Exception:
+                    pass
+                # 自选股K线预热(每10分钟一轮, 让点开K线秒出, 3.6s->秒回)
+                try:
+                    if time.time() - kline_warm_ts > 600:
+                        with db() as c:
+                            wsyms = [r['symbol'] for r in c.execute('SELECT symbol FROM watchlist ORDER BY sort_order')]
+                        for s in wsyms:
+                            for period in ('daily', 'weekly', 'monthly'):
+                                try:
+                                    rows = fetch_kline(s, period)
+                                    if rows:
+                                        save_kline(rows)
+                                except Exception:
+                                    pass
+                        kline_warm_ts = time.time()
                 except Exception:
                     pass
                 time.sleep(55)
