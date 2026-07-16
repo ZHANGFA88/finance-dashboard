@@ -5,6 +5,7 @@ FinSight 金融大屏后端 - 纯标准库 + SQLite
 多源: A股走东方财富(~3秒), 港美股/ETF/外汇/加密走 Yahoo Finance
 """
 import os, json, time, sqlite3, urllib.parse, urllib.request, re, threading, random
+import http.cookiejar, gzip
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -368,6 +369,97 @@ def fetch_tencent(symbols):
         pass
     return out
 
+# ========== 雪球 token 管理器(第5源, token缓存~25分钟) ==========
+_xq_state = {'opener': None, 'ts': 0}
+_xq_lock = threading.Lock()
+
+def _xq_opener(force=False):
+    """获取带雪球 token 的 opener，token 缓存 1500s。两步式: 首页拿acw_tc → /hq下发xq_a_token。"""
+    now = time.time()
+    with _xq_lock:
+        if not force and _xq_state['opener'] and now - _xq_state['ts'] < 1500:
+            return _xq_state['opener']
+        cj = http.cookiejar.CookieJar()
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        op.addheaders = [('User-Agent', UA)]
+        try:
+            _THROTTLE.wait('xueqiu.com', 0.3)
+            op.open('https://xueqiu.com', timeout=10).read()
+            _THROTTLE.wait('xueqiu.com', 0.3)
+            op.open('https://xueqiu.com/hq', timeout=10).read()
+        except Exception:
+            return None
+        names = [c.name for c in cj]
+        if 'xq_a_token' not in names:
+            return None
+        _xq_state['opener'] = op
+        _xq_state['ts'] = now
+        return op
+
+def fetch_cn_xueqiu(symbols):
+    """A股行情备源: 雪球 batch/quote(第5层兜底, 字段最全, 支持批量)。"""
+    out = {}
+    xq_syms = []
+    code_map = {}
+    for sym in symbols:
+        code = sym.split('.')[0]
+        if sym.endswith('.SS'):
+            xs = 'SH' + code
+        elif sym.endswith('.SZ'):
+            xs = 'SZ' + code
+        else:
+            continue
+        xq_syms.append(xs)
+        code_map[xs] = sym
+    if not xq_syms:
+        return out
+    for attempt in range(2):
+        op = _xq_opener(force=(attempt > 0))
+        if not op:
+            time.sleep(0.5)
+            continue
+        try:
+            url = ('https://stock.xueqiu.com/v5/stock/batch/quote.json?symbol='
+                   + ','.join(xq_syms))
+            _THROTTLE.wait('xueqiu.com', 0.3)
+            req = urllib.request.Request(url, headers={
+                'User-Agent': UA, 'Referer': 'https://xueqiu.com',
+                'Accept': 'application/json'})
+            r = op.open(req, timeout=10)
+            raw = r.read()
+            if r.headers.get('Content-Encoding') == 'gzip':
+                raw = gzip.decompress(raw)
+            d = json.loads(raw.decode('utf-8', 'ignore'))
+            items = (d.get('data') or {}).get('items') or []
+            for it in items:
+                q = it.get('quote') or {}
+                xs = q.get('symbol')
+                sym = code_map.get(xs)
+                if not sym:
+                    continue
+                price = q.get('current')
+                if price in (None, '', 0):
+                    continue
+                prev = q.get('last_close') or 0
+                out[sym] = {
+                    'symbol': sym, 'name': q.get('name') or sym, 'market': 'cn',
+                    'price': round(float(price), 2),
+                    'change_pct': round(float(q.get('percent') or 0), 2),
+                    'change_amt': round(float(q.get('chg') or 0), 2),
+                    'open': round(float(q.get('open') or 0), 2),
+                    'high': round(float(q.get('high') or 0), 2),
+                    'low': round(float(q.get('low') or 0), 2),
+                    'prev_close': round(float(prev), 2),
+                    'volume': float(q.get('volume') or 0),
+                    'ts': int(time.time()),
+                }
+            if out:
+                return out
+        except Exception:
+            _xq_state['opener'] = None  # 下次强制重取token
+            time.sleep(0.5)
+    return out
+
 def fetch_cn_baidu(symbols):
     """A股行情备源: 百度股市通(新浪/东财都挂时的第4层兜底)。逐只拉, 带限流。"""
     import subprocess
@@ -447,6 +539,9 @@ def fetch_quotes(symbols, fallback_db=True):
         missing = [s for s in cn if s not in r]
         if missing:
             r.update(fetch_cn_eastmoney(missing))
+        missing = [s for s in cn if s not in r]
+        if missing:
+            r.update(fetch_cn_xueqiu(missing))
         missing = [s for s in cn if s not in r]
         if missing:
             r.update(fetch_cn_baidu(missing))
