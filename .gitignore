@@ -13,3 +13,4 @@ __pycache__/
 # env
 .env
 .cyqenv/
+data/alert_push_state.json
