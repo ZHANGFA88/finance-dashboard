@@ -14,3 +14,4 @@ __pycache__/
 .env
 .cyqenv/
 data/alert_push_state.json
+data/stale_alarm_state.json

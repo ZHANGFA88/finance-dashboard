@@ -282,7 +282,7 @@ def fetch_yahoo(symbols):
             try:
                 host = 'query1'
                 url = f'https://{host}.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?interval=1d&range=1d'
-                d = json.loads(http_get_retry(url, timeout=5))
+                d = json.loads(http_get_retry(url, timeout=4, tries=1))
                 res = d.get('chart', {}).get('result')
                 if not res:
                     raise ValueError('no result')
