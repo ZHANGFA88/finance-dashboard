@@ -315,6 +315,75 @@ def fetch_yahoo(symbols):
         time.sleep(0.15)
     return out
 
+def _sina_global_code(sym):
+    """统一代码 -> 新浪国际代码。AAPL->gb_aapl, 0700.HK->rt_hk00700"""
+    if sym.endswith('.HK'):
+        return 'rt_hk' + sym[:-3].zfill(5)
+    if sym.endswith('-USD') or sym.endswith('=X'):
+        return None  # 加密/外汇新浪此接口不支持
+    return 'gb_' + sym.lower()  # 美股
+
+def fetch_sina_global(symbols):
+    """新浪 美股/港股源（腾讯后路, 第2活源）。批量混拉, GBK编码。
+    美股 gb_: 名称,现价,涨跌幅%,时间,涨跌额,开盘,最高,最低,52高,52低...
+    港股 rt_hk: 英文名,中文名,开盘,昨收,最高,最低,现价,涨跌额,涨跌幅%..."""
+    out = {}
+    code_map = {}
+    for s in symbols:
+        sc = _sina_global_code(s)
+        if sc:
+            code_map[sc] = s
+    if not code_map:
+        return out
+    for attempt in range(2):
+        try:
+            url = 'https://hq.sinajs.cn/list=' + ','.join(code_map.keys())
+            req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': 'https://finance.sina.com.cn'})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                raw = r.read().decode('gbk', 'ignore')
+            for line in raw.splitlines():
+                m = re.match(r'var hq_str_(\w+)="(.*)";', line)
+                if not m:
+                    continue
+                sc, body = m.group(1), m.group(2)
+                sym = code_map.get(sc)
+                if not sym or not body:
+                    continue
+                p = body.split(',')
+                try:
+                    if sc.startswith('rt_hk'):
+                        # 港股: [0]英文名 [1]中文名 [2]开盘 [3]昨收 [4]最高 [5]最低 [6]现价
+                        if len(p) < 7:
+                            continue
+                        name = p[1] or sym; openp = float(p[2]); prev = float(p[3])
+                        high = float(p[4]); low = float(p[5]); price = float(p[6])
+                    else:
+                        # 美股 gb_: [0]名称 [1]现价 [2]涨跌幅% [3]时间 [4]涨跌额 [5]开盘 [6]最高 [7]最低
+                        if len(p) < 8:
+                            continue
+                        name = p[0] or sym; price = float(p[1]); openp = float(p[5])
+                        high = float(p[6]); low = float(p[7])
+                        prev = price - float(p[4]) if p[4] else price
+                    if price <= 0:
+                        continue
+                    chg = price - prev
+                    out[sym] = {
+                        'symbol': sym, 'name': name, 'market': None,
+                        'price': round(price, 4),
+                        'change_pct': round((chg / prev * 100) if prev else 0, 2),
+                        'change_amt': round(chg, 4),
+                        'open': round(openp, 4), 'high': round(high, 4), 'low': round(low, 4),
+                        'prev_close': round(prev, 4) if prev else 0, 'volume': 0,
+                        'ts': int(time.time()),
+                    }
+                except (ValueError, IndexError):
+                    continue
+            if out:
+                return out
+        except Exception:
+            time.sleep(0.5)
+    return out
+
 def _tencent_code(sym):
     """统一代码 -> 腾讯代码。AAPL->usAAPL, 0700.HK->hk00700"""
     if sym.endswith('.HK'):
@@ -554,13 +623,17 @@ def fetch_quotes(symbols, fallback_db=True):
             r.update(fetch_cn_baidu(missing))
         result.update(r)
     if other:
-        # 港股/美股: 腾讯优先(国内快且稳, 0.2s), Yahoo只留给腾讯不支持的加密/外汇
+        # 港股/美股: 腾讯优先(国内快且稳, 0.2s), 新浪二源, Yahoo留给加密/外汇
         tencent_ok = [s for s in other if _tencent_code(s)]  # 港美股
         yahoo_only = [s for s in other if not _tencent_code(s)]  # 加密-USD/外汇=X
         r = {}
         if tencent_ok:
             r.update(fetch_tencent(tencent_ok))
-        # 腾讯没拿到的 + 加密外汇 → Yahoo兼底
+        # 腾讯没拿到的港美股 → 新浪二源
+        sina_miss = [s for s in tencent_ok if s not in r]
+        if sina_miss:
+            r.update(fetch_sina_global(sina_miss))
+        # 仍缺的 + 加密外汇 → Yahoo兼底
         missing = [s for s in other if s not in r]
         if missing:
             r.update(fetch_yahoo(missing))
