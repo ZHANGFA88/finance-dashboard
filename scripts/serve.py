@@ -1171,6 +1171,75 @@ def _global_index_cache_get(ttl=60):
         return data
     return _global_idx_cache['data'] or []
 
+def fetch_news_global(limit=20):
+    """全局财经快讯(东财快讯)。返回 [{title,url,time,ts}]。"""
+    import subprocess
+    url = ('https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_%d_1_.html' % limit)
+    for attempt in range(2):
+        try:
+            _throttle_url(url)
+            raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                                  '-H', 'Referer: https://kuaixun.eastmoney.com/',
+                                  '-H', 'User-Agent: ' + UA, url],
+                                 capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+            # 形如 var ajaxResult={...};
+            m = raw.find('{')
+            if m < 0:
+                raise ValueError('no json')
+            j = raw[m:].rstrip().rstrip(';')
+            d = json.loads(j)
+            out = []
+            for it in (d.get('LivesList') or [])[:limit]:
+                title = (it.get('title') or '').strip()
+                if not title:
+                    continue
+                out.append({
+                    'title': title,
+                    'url': it.get('url_w') or it.get('url_m') or '',
+                    'time': it.get('showtime') or it.get('digesttime') or '',
+                    'ts': int(time.time()),
+                })
+            if out:
+                return out
+        except Exception:
+            pass
+        time.sleep(1.0 * (attempt + 1))
+    return []
+
+def fetch_news_stock(symbol, limit=8):
+    """个股相关新闻(东财)。symbol 形如 600519.SS/000001.SZ。返回 [{title,url,time}]。"""
+    import subprocess
+    secid = _eastmoney_secid(symbol)
+    if not secid:
+        return []
+    url = ('https://np-listapi.eastmoney.com/comm/web/getListInfo?client=web&biz=web_news'
+           '&mTypeAndCode=%s&order=1&needInteractData=0&pageindex=1&pagesize=%d&type=1' % (secid, limit))
+    for attempt in range(2):
+        try:
+            _throttle_url(url)
+            raw = subprocess.run(['curl', '-s', '--max-time', '10',
+                                  '-H', 'Referer: https://so.eastmoney.com/',
+                                  '-H', 'User-Agent: ' + UA, url],
+                                 capture_output=True, timeout=13).stdout.decode('utf-8', 'ignore')
+            d = json.loads(raw)
+            lst = ((d.get('data') or {}).get('list')) or []
+            out = []
+            for it in lst[:limit]:
+                title = (it.get('Art_Title') or '').strip()
+                if not title:
+                    continue
+                out.append({
+                    'title': title,
+                    'url': it.get('Art_Url') or it.get('Art_OriginUrl') or '',
+                    'time': it.get('Art_ShowTime') or '',
+                })
+            if out:
+                return out
+        except Exception:
+            pass
+        time.sleep(1.0 * (attempt + 1))
+    return []
+
 def fetch_sectors(kind='concept', limit=10):
     """板块涨幅榜+资金流。kind: concept(概念 t:3) / industry(行业 t:2)，curl拉+重试"""
     t = '3' if kind == 'concept' else '2'
@@ -1385,6 +1454,34 @@ def _sector_cache_get(kind='concept', ttl=60):
     # 空结果也缓存(旧值或空列表)，避免下次又花7秒重试空拉
     _sector_cache[kind] = {'data': (c['data'] if c else []), 'ts': now}
     return _sector_cache[kind]['data']
+
+_news_cache = {}  # key(global / symbol) -> {data, ts}  新闻缓存
+def _news_global_cache_get(ttl=120):
+    """全局快讯带缓存(默认120s)，避免轮询频繁打东财"""
+    now = time.time()
+    c = _news_cache.get('__global__')
+    if c and now - c['ts'] < ttl:
+        return c['data']
+    data = fetch_news_global(limit=20)
+    if data:
+        _news_cache['__global__'] = {'data': data, 'ts': now}
+        return data
+    _news_cache['__global__'] = {'data': (c['data'] if c else []), 'ts': now}
+    return _news_cache['__global__']['data']
+
+def _news_stock_cache_get(symbol, ttl=300):
+    """个股新闻带缓存(默认300s)"""
+    now = time.time()
+    key = 's:' + symbol
+    c = _news_cache.get(key)
+    if c and now - c['ts'] < ttl:
+        return c['data']
+    data = fetch_news_stock(symbol, limit=8)
+    if data:
+        _news_cache[key] = {'data': data, 'ts': now}
+        return data
+    _news_cache[key] = {'data': (c['data'] if c else []), 'ts': now}
+    return _news_cache[key]['data']
 
 def classify_index_trend(idx):
     """大盘定性：由四大指数当日涨跌粗判"""
@@ -1709,6 +1806,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_global(q)
             if path == '/api/finance/sectors':
                 return self._api_sectors(q)
+            if path == '/api/finance/news':
+                return self._api_news(q)
             if path == '/api/finance/picks':
                 return self._api_picks(q)
             if path == '/' :
@@ -1841,6 +1940,17 @@ class Handler(SimpleHTTPRequestHandler):
             kind = 'concept'
         data = _sector_cache_get(kind=kind)
         return self._json(200, {'ok': True, 'kind': kind, 'items': data, 'ts': int(time.time())})
+
+    def _api_news(self, q):
+        """财经新闻。symbol 有值→个股相关新闻; 否则全局快讯。均带缓存"""
+        symbol = (q.get('symbol') or [''])[0].strip()
+        if symbol:
+            symbol = _normalize_symbol(symbol)
+            data = _news_stock_cache_get(symbol)
+            return self._json(200, {'ok': True, 'scope': 'stock', 'symbol': symbol,
+                                    'items': data, 'ts': int(time.time())})
+        data = _news_global_cache_get()
+        return self._json(200, {'ok': True, 'scope': 'global', 'items': data, 'ts': int(time.time())})
 
     def _api_picks(self, q):
         """每日热点选股: 扫涨幅榜技术打分 Top N，带 5分钟缓存(扫描耗时)"""
