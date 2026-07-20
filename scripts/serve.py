@@ -1828,6 +1828,79 @@ def generate_narrative(name, ind, analysis, index_env=None):
 
     return ''.join(seg)
 
+# ========== B5-B: 真 AI 自然语言解读 ==========
+# 本机 openclaw agent 生成, 耗时长(~30s), 所以后台生成+缓存, 前端异步拉。
+_ai_narr_cache = {}   # symbol -> {'text':..., 'ts':..., 'sig':...}
+_ai_narr_pending = set()
+_ai_narr_lock = threading.Lock()
+AI_NARR_TTL = 900     # 15分钟内同一股不重复生成
+OPENCLAW_BIN = os.environ.get('OPENCLAW_BIN', '/opt/homebrew/bin/openclaw')
+
+def _ai_build_prompt(name, ind, analysis, index_env=None):
+    cp = ind.get('close'); pct = ind.get('change_pct', 0) or 0
+    bull = '、'.join((analysis.get('bull_factors') or [])[:4]) or '无'
+    bear = '、'.join((analysis.get('bear_factors') or [])[:4]) or '无'
+    return (
+        '你是专业股票技术面解读助手。基于以下数据，用中文给出简洁点评（80字以内），'
+        '包含趋势判断与操作倾向，直接给结论，不要免责声明、不要分条、不要重复数据：\n'
+        '股票：%s，今日%+.2f%%，现价%s。\n'
+        '多空立场：%s（强度%s，多头%d分 vs 空头%d分）。\n'
+        '多头因素：%s。\n空头因素：%s。\n大盘环境：%s。'
+        % (name, pct, cp, analysis.get('stance', ''), analysis.get('strength', ''),
+           analysis.get('bull_score', 0), analysis.get('bear_score', 0),
+           bull, bear, index_env or '不明')
+    )
+
+def _ai_narr_sig(ind, analysis):
+    """数据指纹: 收价+立场+得分, 变了才重新生成"""
+    return '%s|%s|%s|%s' % (ind.get('close'), analysis.get('stance'),
+                            analysis.get('bull_score'), analysis.get('bear_score'))
+
+def _ai_generate(symbol, name, ind, analysis, index_env, sig):
+    """后台线程: 调 openclaw agent 生成, 写入缓存。"""
+    import subprocess
+    try:
+        prompt = _ai_build_prompt(name, ind, analysis, index_env)
+        p = subprocess.run(
+            [OPENCLAW_BIN, 'agent', '--local', '--json',
+             '--session-key', 'finance-narrative', '-m', prompt],
+            capture_output=True, timeout=200)
+        out = p.stdout.decode('utf-8', 'ignore')
+        text = ''
+        try:
+            d = json.loads(out)
+            pls = d.get('payloads') or []
+            if pls:
+                text = (pls[0].get('text') or '').strip()
+        except Exception:
+            text = ''
+        if text:
+            with _ai_narr_lock:
+                _ai_narr_cache[symbol] = {'text': text, 'ts': int(time.time()), 'sig': sig}
+    except Exception:
+        pass
+    finally:
+        with _ai_narr_lock:
+            _ai_narr_pending.discard(symbol)
+
+def ai_narrative_get(symbol, name, ind, analysis, index_env=None):
+    """返回(status, text)。status: ready|generating。
+    命中新鲜缓存->ready; 否则启后台生成->generating。"""
+    if not analysis or not analysis.get('ok') or not ind or not ind.get('ok'):
+        return ('unavailable', '')
+    sig = _ai_narr_sig(ind, analysis)
+    now = int(time.time())
+    with _ai_narr_lock:
+        c = _ai_narr_cache.get(symbol)
+        if c and c.get('sig') == sig and now - c['ts'] < AI_NARR_TTL:
+            return ('ready', c['text'])
+        if symbol not in _ai_narr_pending:
+            _ai_narr_pending.add(symbol)
+            t = threading.Thread(target=_ai_generate,
+                                 args=(symbol, name, ind, analysis, index_env, sig), daemon=True)
+            t.start()
+    return ('generating', '')
+
 # ========== HTTP 服务 ==========
 _quote_cache = {'data': None, 'ts': 0}
 QUOTE_TTL = 8  # 秒
@@ -1871,6 +1944,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._api_alerts(q)
             if path == '/api/finance/analyze':
                 return self._api_analyze(q)
+            if path == '/api/finance/analyze/ai':
+                return self._api_analyze_ai(q)
             if path == '/api/finance/cyq':
                 return self._api_cyq(q)
             if path == '/api/finance/indices':
@@ -2067,14 +2142,41 @@ class Handler(SimpleHTTPRequestHandler):
         sector_env = None
         analysis = judge_bull_bear(ind, rows, index_env=index_trend, sector_env=sector_env)
         narrative = generate_narrative(name, ind, analysis, index_env=index_trend)
+        # 触发后台 AI 解读生成(不阻塞), 前端随后异步拉 /analyze/ai
+        ai_status, ai_text = ai_narrative_get(symbol, name, ind, analysis, index_env=index_trend)
         return self._json(200, {
             'ok': True, 'symbol': symbol, 'name': name, 'period': period,
             'indicators': ind,
             'market_env': {'trend': index_trend, 'indices': idx},
             'analysis': analysis,
             'narrative': narrative,
+            'ai_narrative': ai_text, 'ai_status': ai_status,
             'ts': int(time.time()),
         })
+
+    def _api_analyze_ai(self, q):
+        """B5-B: 单独拉 AI 解读(后台生成, 前端轮询)。返 status: ready|generating|unavailable。"""
+        symbol = (q.get('symbol') or [''])[0]
+        if not symbol:
+            return self._json(400, {'ok': False, 'error': 'symbol required'})
+        period = (q.get('period') or ['daily'])[0]
+        rows = get_kline_db(symbol, period)
+        if not rows or len(rows) < 30:
+            save_kline(fetch_kline(symbol, period))
+            rows = get_kline_db(symbol, period)
+        ind = compute_indicators(rows)
+        if not ind.get('ok'):
+            return self._json(200, {'ok': False, 'status': 'unavailable', 'symbol': symbol})
+        name = symbol
+        with db() as c:
+            r = c.execute('SELECT name FROM watchlist WHERE symbol=?', (symbol,)).fetchone()
+            if r:
+                name = r['name'] or symbol
+        idx = _index_cache_get()
+        index_trend = classify_index_trend(idx)
+        analysis = judge_bull_bear(ind, rows, index_env=index_trend, sector_env=None)
+        status, text = ai_narrative_get(symbol, name, ind, analysis, index_env=index_trend)
+        return self._json(200, {'ok': True, 'symbol': symbol, 'status': status, 'ai_narrative': text})
 
     def _api_cyq(self, q):
         """C2: 筹码分布。subprocess 调独立 .cyqenv 跑 cyq_report.py（akshare 重依赖隔离），带 60s 缓存。"""

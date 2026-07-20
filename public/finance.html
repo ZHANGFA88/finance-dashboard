@@ -450,6 +450,8 @@
   .an-narrative { padding: 12px 14px; margin-bottom: 14px; border-radius: 10px; line-height: 1.7;
     font-size: 13px; color: var(--text); background: rgba(212,175,90,0.06);
     border: 1px solid rgba(212,175,90,0.25); }
+  .an-narrative.ai { background: rgba(90,160,212,0.08); border-color: rgba(90,160,212,0.30); }
+  .an-narrative.ai .an-nr-tag { background: rgba(90,160,212,0.20); color: #7db8e8; }
   .an-nr-tag { display: inline-block; margin-right: 8px; padding: 1px 8px; border-radius: 5px;
     font-size: 11px; color: #1a1206; background: var(--gold); font-weight: 700; vertical-align: middle; }
   /* C3 筹码面板 */
@@ -1310,9 +1312,28 @@
       anLoading.style.display = 'none';
       anContent.style.display = 'block';
       anContent.innerHTML = renderAnalyze(d);
+      // AI 解读异步轮询(未就绪时)
+      if (d.ai_status === 'generating') pollAiNarrative(curSymbol);
     } catch (e) {
       anLoading.textContent = '分析加载失败';
     }
+  }
+
+  async function pollAiNarrative(sym, tries) {
+    tries = tries || 0;
+    if (tries > 40 || sym !== curSymbol) return;  // 最多轮询~200s
+    await new Promise(r => setTimeout(r, 5000));
+    if (sym !== curSymbol) return;
+    try {
+      const r = await fetch('/api/finance/analyze/ai?symbol=' + encodeURIComponent(sym) + '&period=daily');
+      const d = await r.json();
+      const el = document.getElementById('aiNarr');
+      if (d.status === 'ready' && d.ai_narrative && el) {
+        el.innerHTML = '<span class="an-nr-tag">🤖 AI解读</span>' + d.ai_narrative;
+        return;
+      }
+    } catch (e) {}
+    pollAiNarrative(sym, tries + 1);
   }
 
   function renderAnalyze(d) {
@@ -1329,6 +1350,12 @@
     // 自然语言解读
     if (d.narrative) {
       html += '<div class="an-narrative"><span class="an-nr-tag">📝 解读</span>' + d.narrative + '</div>';
+    }
+    // 🤖 AI 解读(异步): 就绪直接显示, 否则占位并轮询
+    if (d.ai_status === 'ready' && d.ai_narrative) {
+      html += '<div class="an-narrative ai" id="aiNarr"><span class="an-nr-tag">🤖 AI解读</span>' + d.ai_narrative + '</div>';
+    } else if (d.ai_status === 'generating') {
+      html += '<div class="an-narrative ai" id="aiNarr"><span class="an-nr-tag">🤖 AI解读</span><span style="opacity:.6">AI 正在生成解读…</span></div>';
     }
     // 结论
     html += '<div class="an-verdict">' +
